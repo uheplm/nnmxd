@@ -1,0 +1,9 @@
+/mxmoused
+/spike
+/bin/
+/dist/
+*.bin
+*.test
+*.out
+.DS_Store
+.docs

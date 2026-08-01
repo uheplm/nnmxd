@@ -1,0 +1,31 @@
+// Example /etc/logid.cfg for using mxmoused with an MX Master 3S.
+//
+// Thumb button (cid 0xc3, BTN_FORWARD on evdev) is intentionally NOT listed
+// here. Listing a cid in `buttons:` makes logid divert it via HID++ — even
+// with action `None`, the event is then swallowed and never reaches evdev.
+// To leave the button untouched, omit it entirely; mxmoused grabs it via
+// evdev directly.
+//
+// Copy to /etc/logid.cfg and `sudo systemctl restart logid` to apply.
+
+devices: (
+{
+    name: "MX Master 3S";
+
+    smartshift:
+    {
+        on: true;
+        threshold: 30;
+        torque: 50;
+    };
+
+    hiresscroll:
+    {
+        hires: true;
+        invert: false;
+        target: false;
+    };
+
+    dpi: 1000;
+}
+);
