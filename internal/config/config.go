@@ -25,14 +25,52 @@ type Device struct {
 	TriggerButton string `json:"triggerButton"`
 }
 
+type ActionType string
+
+const (
+	ActionNiri     ActionType = "niri"
+	ActionNoctalia ActionType = "noctalia"
+	ActionCommand  ActionType = "command"
+)
+
+type Action struct {
+	Type      ActionType `json:"type"`
+	Value     string     `json:"value"`
+	Arguments string     `json:"arguments,omitempty"`
+}
+
+func (a *Action) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var legacy string
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		*a = Action{Type: ActionNiri, Value: legacy}
+		return nil
+	}
+
+	type actionJSON Action
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded actionJSON
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if decoded.Type == "" {
+		decoded.Type = ActionNiri
+	}
+	*a = Action(decoded)
+	return nil
+}
+
 type Bindings struct {
-	Left       string `json:"left"`
-	Right      string `json:"right"`
-	Up         string `json:"up"`
-	Down       string `json:"down"`
-	Tap        string `json:"tap"`
-	ScrollUp   string `json:"scrollUp"`
-	ScrollDown string `json:"scrollDown"`
+	Left       Action `json:"left"`
+	Right      Action `json:"right"`
+	Up         Action `json:"up"`
+	Down       Action `json:"down"`
+	Tap        Action `json:"tap"`
+	ScrollUp   Action `json:"scrollUp"`
+	ScrollDown Action `json:"scrollDown"`
 }
 
 type Preset struct {
@@ -51,8 +89,12 @@ type Config struct {
 	DefaultPresetID string            `json:"defaultPresetId"`
 	Presets         []Preset          `json:"presets"`
 	AppPresets      map[string]string `json:"appPresets"`
-	MetaStateFile   string            `json:"metaStateFile"`
-	WriteWaybar     bool              `json:"writeWaybar"`
+}
+
+type configFile struct {
+	Config
+	MetaStateFile string `json:"metaStateFile"`
+	WriteWaybar   bool   `json:"writeWaybar"`
 }
 
 func Defaults() Config {
@@ -71,18 +113,16 @@ func Defaults() Config {
 			Escalation: 250,
 			MetaKey:    "KEY_LEFTMETA",
 			Bindings: Bindings{
-				Left:       "focus-column-left",
-				Right:      "focus-column-right",
-				Up:         "focus-workspace-up",
-				Down:       "focus-workspace-down",
-				Tap:        "toggle-overview",
-				ScrollUp:   "focus-workspace-up",
-				ScrollDown: "focus-workspace-down",
+				Left:       Action{Type: ActionNiri, Value: "focus-column-left"},
+				Right:      Action{Type: ActionNiri, Value: "focus-column-right"},
+				Up:         Action{Type: ActionNiri, Value: "focus-workspace-up"},
+				Down:       Action{Type: ActionNiri, Value: "focus-workspace-down"},
+				Tap:        Action{Type: ActionNiri, Value: "toggle-overview"},
+				ScrollUp:   Action{Type: ActionNiri, Value: "focus-workspace-up"},
+				ScrollDown: Action{Type: ActionNiri, Value: "focus-workspace-down"},
 			},
 		}},
-		AppPresets:    map[string]string{},
-		MetaStateFile: "/tmp/mxmouse-meta-state",
-		WriteWaybar:   false,
+		AppPresets: map[string]string{},
 	}
 }
 
@@ -111,7 +151,8 @@ func Load(path string) (Config, error) {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&cfg); err != nil {
+	file := configFile{Config: cfg}
+	if err := decoder.Decode(&file); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
@@ -120,6 +161,7 @@ func Load(path string) (Config, error) {
 		}
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	cfg = file.Config
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate config %s: %w", path, err)
 	}
@@ -156,6 +198,16 @@ func (c Config) Validate() error {
 			if preset.Escalation < 0 {
 				return fmt.Errorf("preset %q escalation cannot be negative", preset.ID)
 			}
+			for name, binding := range map[string]Action{
+				"left": preset.Bindings.Left, "right": preset.Bindings.Right,
+				"up": preset.Bindings.Up, "down": preset.Bindings.Down,
+				"tap": preset.Bindings.Tap, "scrollUp": preset.Bindings.ScrollUp,
+				"scrollDown": preset.Bindings.ScrollDown,
+			} {
+				if err := binding.Validate(); err != nil {
+					return fmt.Errorf("preset %q binding %s: %w", preset.ID, name, err)
+				}
+			}
 		case ModeMetaToggle:
 			if preset.MetaKey == "" {
 				return fmt.Errorf("preset %q metaKey is required in meta-toggle mode", preset.ID)
@@ -179,8 +231,14 @@ func (c Config) Validate() error {
 			return fmt.Errorf("app_id %q refers to unknown preset %q", appID, presetID)
 		}
 	}
-	if c.WriteWaybar && c.MetaStateFile == "" {
-		return errors.New("metaStateFile is required when writeWaybar is enabled")
+	return nil
+}
+
+func (a Action) Validate() error {
+	switch a.Type {
+	case "", ActionNiri, ActionNoctalia, ActionCommand:
+	default:
+		return fmt.Errorf("unsupported action type %q", a.Type)
 	}
 	return nil
 }

@@ -57,36 +57,3 @@ func TestWriteConfigDoesNotReplaceValidConfigWithInvalidCandidate(t *testing.T) 
 		t.Fatal("invalid candidate replaced existing config")
 	}
 }
-
-func TestWriteMetaState(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "waybar-state")
-	cfg := config.Defaults()
-	cfg.WriteWaybar = true
-	cfg.MetaStateFile = path
-
-	writeMetaState(cfg, true)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var on waybarState
-	if err := json.Unmarshal(data, &on); err != nil {
-		t.Fatal(err)
-	}
-	if on.Class != "on" || on.Text != "META" {
-		t.Fatalf("on state = %#v", on)
-	}
-
-	writeMetaState(cfg, false)
-	data, err = os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var off waybarState
-	if err := json.Unmarshal(data, &off); err != nil {
-		t.Fatal(err)
-	}
-	if off.Class != "off" || off.Text != "" {
-		t.Fatalf("off state = %#v", off)
-	}
-}

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,13 +36,6 @@ type Status struct {
 type reporter struct {
 	path string
 	data Status
-}
-
-type waybarState struct {
-	Text    string `json:"text"`
-	Alt     string `json:"alt"`
-	Class   string `json:"class"`
-	Tooltip string `json:"tooltip"`
 }
 
 func (r *reporter) update() {
@@ -103,7 +98,6 @@ func Run(ctx context.Context, configPath, statusPath string) error {
 			wait(ctx, 3*time.Second)
 			continue
 		}
-		writeMetaState(cfg, false)
 		dev, err := device.Open(cfg.Device)
 		if err != nil {
 			status.data = Status{LastError: err.Error()}
@@ -176,11 +170,9 @@ func runDevice(
 		select {
 		case <-ctx.Done():
 			releaseMetaKeys(keyboard, pressedMeta)
-			writeMetaState(currentConfig, len(pressedMeta) > 0)
 			return nil
 		case err := <-readErrors:
 			releaseMetaKeys(keyboard, pressedMeta)
-			writeMetaState(currentConfig, len(pressedMeta) > 0)
 			return err
 		case event := <-events:
 			if event == nil {
@@ -230,7 +222,6 @@ func runDevice(
 						_ = engine.Step(gesture.Input{Kind: gesture.ButtonPress})
 					}
 					status.data.MetaOn = len(pressedMeta) > 0
-					writeMetaState(currentConfig, status.data.MetaOn)
 					status.update()
 				case 0:
 					if gestureActive && engine != nil {
@@ -310,30 +301,110 @@ func releaseMetaKeys(keyboard *evdev.InputDevice, pressed map[evdev.EvCode]bool)
 	}
 }
 
-func writeMetaState(cfg config.Config, on bool) {
-	if !cfg.WriteWaybar {
-		return
-	}
-	state := waybarState{}
-	if on {
-		state = waybarState{Text: "META", Alt: "on", Class: "on", Tooltip: "Meta is ON"}
-	} else {
-		state = waybarState{Alt: "off", Class: "off", Tooltip: "Meta is OFF"}
-	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		log.Printf("encode Waybar state: %v", err)
-		return
-	}
-	if err := os.WriteFile(cfg.MetaStateFile, append(data, '\n'), 0o644); err != nil {
-		log.Printf("write Waybar state: %v", err)
+func dispatchActions(client *niri.Client, actions []config.Action) {
+	for _, action := range actions {
+		switch action.Type {
+		case "", config.ActionNiri:
+			args, err := actionArguments(action)
+			if err != nil {
+				log.Printf("parse Niri action %q: %v", action.Value, err)
+				continue
+			}
+			client.ActionArgs(args)
+		case config.ActionNoctalia:
+			args, err := actionArguments(action)
+			if err != nil {
+				log.Printf("parse Noctalia action %q: %v", action.Value, err)
+				continue
+			}
+			if len(args) == 0 {
+				continue
+			}
+			go runGestureCommand("noctalia", append([]string{"msg"}, args...)...)
+		case config.ActionCommand:
+			go runGestureShellCommand(action.Value)
+		}
 	}
 }
 
-func dispatchActions(client *niri.Client, actions []string) {
-	for _, action := range actions {
-		client.Action(action)
+func actionArguments(action config.Action) ([]string, error) {
+	args, err := splitActionArguments(action.Value)
+	if err != nil {
+		return nil, err
 	}
+	if len(args) == 0 {
+		return nil, nil
+	}
+	additional, err := splitActionArguments(action.Arguments)
+	if err != nil {
+		return nil, err
+	}
+	return append(args, additional...), nil
+}
+
+func splitActionArguments(value string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	inArgument := false
+
+	for _, char := range value {
+		switch {
+		case escaped:
+			current.WriteRune(char)
+			escaped = false
+			inArgument = true
+		case char == '\\' && quote != '\'':
+			escaped = true
+			inArgument = true
+		case quote != 0:
+			if char == quote {
+				quote = 0
+			} else {
+				current.WriteRune(char)
+			}
+		case char == '\'' || char == '"':
+			quote = char
+			inArgument = true
+		case char == ' ' || char == '\t' || char == '\n':
+			if inArgument {
+				args = append(args, current.String())
+				current.Reset()
+				inArgument = false
+			}
+		default:
+			current.WriteRune(char)
+			inArgument = true
+		}
+	}
+	if escaped {
+		return nil, fmt.Errorf("trailing escape")
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote")
+	}
+	if inArgument {
+		args = append(args, current.String())
+	}
+	return args, nil
+}
+
+func runGestureCommand(name string, args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("run gesture command %q: %v: %s", name, err, strings.TrimSpace(string(output)))
+	}
+}
+
+func runGestureShellCommand(command string) {
+	if strings.TrimSpace(command) == "" {
+		return
+	}
+	runGestureCommand("sh", "-c", command)
 }
 
 func forward(clone *evdev.InputDevice, event *evdev.InputEvent) {
