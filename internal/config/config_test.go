@@ -1,129 +1,60 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestDefaultsValidate(t *testing.T) {
+func TestDefaultsValidateAndSelectAppPreset(t *testing.T) {
 	cfg := Defaults()
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Defaults() failed Validate: %v", err)
+		t.Fatalf("defaults invalid: %v", err)
+	}
+	if got := cfg.PresetForApp("org.example.App").ID; got != "default" {
+		t.Fatalf("fallback preset = %q, want default", got)
+	}
+
+	cfg.Presets = append(cfg.Presets, Preset{
+		ID: "meta", Name: "Meta", Mode: ModeMetaToggle, MetaKey: "KEY_LEFTMETA",
+	})
+	cfg.AppPresets["org.example.App"] = "meta"
+	if got := cfg.PresetForApp("org.example.App").ID; got != "meta" {
+		t.Fatalf("assigned preset = %q, want meta", got)
 	}
 }
 
-func TestLoadFromFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	if err := writeFile(path, `
-mode: meta-toggle
-device:
-  auto_detect: true
-  trigger_button: BTN_FORWARD
-meta_toggle:
-  key: KEY_LEFTMETA
-  state_file: /tmp/x-state
-  waybar: true
-`); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Mode != ModeMetaToggle {
-		t.Errorf("mode = %q, want %q", cfg.Mode, ModeMetaToggle)
-	}
-	// Defaults should still fill unspecified gesture fields, even though
-	// meta-toggle mode doesn't use them.
-	if cfg.Gesture.Threshold != 100 {
-		t.Errorf("Gesture.Threshold = %d, want default 100", cfg.Gesture.Threshold)
-	}
-}
-
-func TestValidate(t *testing.T) {
-	cases := []struct {
-		name    string
-		mutate  func(*Config)
-		wantErr string
-	}{
-		{
-			name:    "unknown mode",
-			mutate:  func(c *Config) { c.Mode = "nope" },
-			wantErr: "unknown mode",
-		},
-		{
-			name:    "empty trigger",
-			mutate:  func(c *Config) { c.Device.TriggerButton = "" },
-			wantErr: "trigger_button is required",
-		},
-		{
-			name: "manual device without path",
-			mutate: func(c *Config) {
-				c.Device.AutoDetect = false
-				c.Device.Path = ""
-			},
-			wantErr: "device.path is required",
-		},
-		{
-			name: "gesture zero threshold",
-			mutate: func(c *Config) {
-				c.Mode = ModeGesture
-				c.Gesture.Threshold = 0
-			},
-			wantErr: "threshold must be > 0",
-		},
-		{
-			name: "meta-toggle waybar without state file",
-			mutate: func(c *Config) {
-				c.Mode = ModeMetaToggle
-				c.MetaToggle.Waybar = true
-				c.MetaToggle.StateFile = ""
-			},
-			wantErr: "state_file is required",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Defaults()
-			tc.mutate(&cfg)
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatal("Validate returned nil, want error")
+func TestLoadRejectsUnknownFieldsAndTrailingJSON(t *testing.T) {
+	for name, contents := range map[string]string{
+		"unknown":  `{"version":1,"surprise":true}`,
+		"trailing": `{"version":1} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
 			}
-			if !contains(err.Error(), tc.wantErr) {
-				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load succeeded; want an error")
 			}
 		})
 	}
 }
 
-func TestLoadMissingFileReturnsDefaults(t *testing.T) {
-	// Empty path + no file in search paths in test env (XDG_CONFIG_HOME set to
-	// a nonexistent dir) should still succeed using built-in defaults.
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "nope"))
-	cfg, err := Load("")
+func TestValidationRejectsUnknownPresetAssignment(t *testing.T) {
+	cfg := Defaults()
+	cfg.AppPresets["org.example.App"] = "missing"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate succeeded with unknown preset assignment")
+	}
+}
+
+func TestLoadMissingConfigUsesDefaults(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.json"))
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatal(err)
 	}
-	if cfg.Mode != ModeGesture {
-		t.Errorf("Mode = %q, want default %q", cfg.Mode, ModeGesture)
+	if cfg.DefaultPresetID != "default" {
+		t.Fatalf("default preset = %q", cfg.DefaultPresetID)
 	}
-}
-
-func writeFile(path, content string) error {
-	return osWriteFile(path, []byte(content), 0o644)
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

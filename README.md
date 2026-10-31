@@ -1,72 +1,94 @@
-# mxmoused
+# nnmxd
 
-Userspace daemon that repurposes the Logitech MX Master 3 / 3S thumb button on niri (Wayland).
+`nnmxd` (Noctalia Niri MX daemon) is a native user service for Logitech MX Master 3/3S thumb-button gestures and modifier toggling in Niri. It reads Linux input events directly, clones the pointer through uinput, dispatches Niri actions, and chooses presets using the focused window's exact `app_id`. It does not execute or depend on the old `mxmoused` program, and it does not depend on logid.
 
-Two modes, selectable in `config.yaml`:
+The companion `ffngs/mxmouse` Noctalia plugin provides a panel for service status, device settings, gesture bindings, and per-application preset assignments.
 
-- **gesture** — macOS-style gesture navigation. Tap the thumb button to toggle the niri overview; hold and drag to switch columns/workspaces; hold and scroll to switch workspaces.
-- **meta-toggle** — press the thumb button to virtually hold the Super key so niri keybinds work without holding a keyboard key. Writes a Waybar-compatible JSON state file.
+## Features
 
-## Status
+- Hold the configured thumb button and move to dispatch directional Niri actions. Multiple steps in one hold use the configured threshold and escalation distance.
+- Tap the button to dispatch the preset's tap action.
+- Hold and scroll to dispatch scroll-up/down actions.
+- Presets can use gesture or meta-toggle mode. Meta-toggle injects a configured modifier key on each press and releases all held virtual keys when the service stops.
+- Assign a preset to each exact Niri `app_id`; all other apps use the configured default preset.
+- The pointer device is grabbed while the service runs and all non-gesture events are forwarded through a virtual clone.
+- Optional Waybar-compatible JSON state file for modifier toggle state.
 
-Early development. No release yet. Packaging (AUR, deb, rpm) is tracked but not built.
+## Input permissions
+
+This is a user service, not a root daemon. The running user needs read/write access to the mouse's `/dev/input/event*` node and `/dev/uinput`. On common Linux distributions both are owned by `root:input` with group read/write permissions. Add your user to the `input` group, then fully log out and back in:
+
+```sh
+sudo usermod -aG input "$USER"
+```
+
+Check permissions before starting:
+
+```sh
+ls -l /dev/input/by-id /dev/uinput
+```
+
+The `input` group can access every input device on the system, not just the mouse. If that is too broad for your setup, use a narrowly scoped udev rule/group for the Logitech input node and uinput instead. The service will report permission errors in its status and journal; it does not elevate privileges.
 
 ## Install
 
-The repo ships a `Makefile` that handles the full lifecycle:
+Install Git, Make, Go, and the Linux uinput kernel module, ensure the input permissions above are in place, then:
 
 ```sh
-make install     # build + install binary + system unit + enable & start
-make reinstall   # rebuild + restart  (the edit→try loop)
-make logs        # follow journal
+make install
+```
+
+This builds `nnmxd`, installs the binary in `~/.local/bin`, installs and enables `nnmxd.service`, and starts the user service. To update after changing the source:
+
+```sh
+make reinstall
+```
+
+Useful commands:
+
+```sh
 make status
+make logs
+make stop
+make start
 make uninstall
 ```
 
-Binary lands in `~/.local/bin/mxmoused`; the systemd unit at `/etc/systemd/system/mxmoused.service`. Root is required at runtime — the daemon grabs an evdev input device and creates a `uinput` clone — so the unit runs as a system service. `sudo` is invoked only for the unit-install and `systemctl` calls.
+The service writes its runtime status to `$XDG_RUNTIME_DIR/mxmouse/status.json`. Its configuration is stored in `$XDG_CONFIG_HOME/mxmouse/config.json`, or `~/.config/mxmouse/config.json` when `XDG_CONFIG_HOME` is unset. These paths retain the MX Mouse product namespace. The Noctalia panel writes configuration through nnmxd's validated, atomic `--apply-config` operation. Preset and app mapping edits are picked up at the next thumb-button press; changing device detection, device path, or trigger button requires restarting the service.
 
-For a one-off dev run without installing:
-
-```sh
-go build -o bin/mxmoused ./cmd/mxmoused
-sudo ./bin/mxmoused --config ./configs/mxmoused.example.yaml
-```
-
-## Config
-
-See `configs/mxmoused.example.yaml`. At runtime, `mxmoused` looks for a config in this order:
-
-1. `--config <path>` flag
-2. `$XDG_CONFIG_HOME/mxmoused/config.yaml` (fallback: `~/.config/mxmoused/config.yaml`)
-3. `/etc/mxmoused/config.yaml`
-
-`make install` seeds `~/.config/mxmoused/config.yaml` from the example on first run and never overwrites an existing file.
-
-## Optional: logid integration
-
-`mxmoused` is **not** a LogiOps rewrite. HID++ features (SmartShift, hi-res scroll, DPI, profiles) are delegated to [`logid`](https://github.com/PixlOne/logiops) over D-Bus when it is running. `logid` is a soft dependency — without it, only compositor-level features work; `logid:*` bindings in your config drop silently with a single warning.
-
-When `logid` is present you can use these action names in the gesture `bindings:` block:
-
-- `logid:cycle-profile` — rotate to the next profile in `logid.cfg` order
-- `logid:set-profile:<name>` — switch to a named profile
-
-### `/etc/logid.cfg` gotcha
-
-If you list the thumb-button cid (`0xc3` on MX Master 3/3S) in `logid.cfg`'s `buttons:` array, **logid swallows the event** — even with `action = { type: "None"; }`. The press never reaches evdev and `mxmoused` sees nothing. Listing the cid is itself the divert; the action only decides what happens *after* the divert.
-
-Fix: omit the cid entirely. A working reference for an MX Master 3S lives at `configs/logid.cfg.example`. Apply with:
+The Noctalia plugin can install nnmxd from source into `~/.local/src/nnmxd` by running `make install`. This compiles on the user's machine and downloads Go module dependencies through Go; no compiled dependency bundle is shipped. To install manually:
 
 ```sh
-sudo cp configs/logid.cfg.example /etc/logid.cfg
-sudo systemctl restart logid
+git clone https://github.com/uheplm/nnmxd.git ~/.local/src/nnmxd
+make -C ~/.local/src/nnmxd install
 ```
 
-## Supported hardware
+If the legacy system-level `mxmoused.service` is still installed, stop it before starting nnmxd so the two daemons do not contend for the same input device:
 
-- Logitech MX Master 3 and 3S
-- Both USB receiver (`BUS_USB`) and Bluetooth (`BUS_BLUETOOTH`)
-- Detected by vendor id `0x046d` + presence of the configured trigger button
+```sh
+sudo systemctl disable --now mxmoused.service
+```
+
+## Noctalia plugin
+
+Install `ffngs/mxmouse` from the community catalog. If nnmxd is missing, the panel offers the source-build installation wizard. Open the **MX Mouse** panel from the plugin entry or:
+
+```sh
+noctalia msg panel-toggle ffngs/mxmouse:manager
+```
+
+Create and edit presets in the panel. Choose gesture or meta-toggle mode; gesture bindings are Niri action names, such as `focus-column-left` or `toggle-overview`. In the per-application list, **Next preset** cycles between the default and named presets for that exact app ID. Use **Save configuration** to validate and write changes. Use **Restart input service** after changing device options.
+
+The focused `app_id` comes from `niri msg --json windows`. Window title is displayed for identification but does not participate in preset matching. Niri and nnmxd must both be installed; the daemon is normally installed at `~/.local/bin/nnmxd`.
+
+## Development
+
+```sh
+make test
+make build
+```
+
+The gesture engine is a pure state machine with unit tests. Evdev and uinput need a real Linux input stack, so tests do not grab the mouse or inject events.
 
 ## License
 

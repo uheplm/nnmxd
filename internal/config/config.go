@@ -1,15 +1,16 @@
-// Package config loads, validates, and provides defaults for mxmoused's
-// YAML configuration.
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-
-	"gopkg.in/yaml.v3"
 )
+
+const Version = 1
 
 type Mode string
 
@@ -18,61 +19,58 @@ const (
 	ModeMetaToggle Mode = "meta-toggle"
 )
 
+type Device struct {
+	AutoDetect    bool   `json:"autoDetect"`
+	Path          string `json:"path"`
+	TriggerButton string `json:"triggerButton"`
+}
+
+type Bindings struct {
+	Left       string `json:"left"`
+	Right      string `json:"right"`
+	Up         string `json:"up"`
+	Down       string `json:"down"`
+	Tap        string `json:"tap"`
+	ScrollUp   string `json:"scrollUp"`
+	ScrollDown string `json:"scrollDown"`
+}
+
+type Preset struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Mode       Mode     `json:"mode"`
+	Threshold  int      `json:"threshold"`
+	Escalation int      `json:"escalation"`
+	MetaKey    string   `json:"metaKey"`
+	Bindings   Bindings `json:"bindings"`
+}
+
 type Config struct {
-	Mode       Mode             `yaml:"mode"`
-	Device     DeviceConfig     `yaml:"device"`
-	Gesture    GestureConfig    `yaml:"gesture"`
-	MetaToggle MetaToggleConfig `yaml:"meta_toggle"`
-	Logid      LogidConfig      `yaml:"logid"`
+	Version         int               `json:"version"`
+	Device          Device            `json:"device"`
+	DefaultPresetID string            `json:"defaultPresetId"`
+	Presets         []Preset          `json:"presets"`
+	AppPresets      map[string]string `json:"appPresets"`
+	MetaStateFile   string            `json:"metaStateFile"`
+	WriteWaybar     bool              `json:"writeWaybar"`
 }
 
-type DeviceConfig struct {
-	AutoDetect    bool   `yaml:"auto_detect"`
-	Path          string `yaml:"path"`
-	TriggerButton string `yaml:"trigger_button"`
-}
-
-type GestureConfig struct {
-	Threshold  int             `yaml:"threshold"`
-	Escalation int             `yaml:"escalation"`
-	Bindings   GestureBindings `yaml:"bindings"`
-}
-
-type GestureBindings struct {
-	Left       string `yaml:"left"`
-	Right      string `yaml:"right"`
-	Up         string `yaml:"up"`
-	Down       string `yaml:"down"`
-	Tap        string `yaml:"tap"`
-	ScrollUp   string `yaml:"scroll_up"`
-	ScrollDown string `yaml:"scroll_down"`
-}
-
-type MetaToggleConfig struct {
-	Key       string `yaml:"key"`
-	StateFile string `yaml:"state_file"`
-	Waybar    bool   `yaml:"waybar"`
-}
-
-type LogidConfig struct {
-	// DeviceName is the device name as it appears in logid.cfg. When empty,
-	// mxmoused tries "MX Master 3S" and then "MX Master 3" in order.
-	DeviceName string `yaml:"device_name"`
-}
-
-// Defaults returns a Config with sane built-in defaults. YAML unmarshal onto a
-// pre-populated Defaults() preserves defaults for keys omitted from the file.
 func Defaults() Config {
 	return Config{
-		Mode: ModeGesture,
-		Device: DeviceConfig{
+		Version: Version,
+		Device: Device{
 			AutoDetect:    true,
 			TriggerButton: "BTN_FORWARD",
 		},
-		Gesture: GestureConfig{
+		DefaultPresetID: "default",
+		Presets: []Preset{{
+			ID:         "default",
+			Name:       "Default",
+			Mode:       ModeGesture,
 			Threshold:  100,
 			Escalation: 250,
-			Bindings: GestureBindings{
+			MetaKey:    "KEY_LEFTMETA",
+			Bindings: Bindings{
 				Left:       "focus-column-left",
 				Right:      "focus-column-right",
 				Up:         "focus-workspace-up",
@@ -81,97 +79,133 @@ func Defaults() Config {
 				ScrollUp:   "focus-workspace-up",
 				ScrollDown: "focus-workspace-down",
 			},
-		},
-		MetaToggle: MetaToggleConfig{
-			Key:       "KEY_LEFTMETA",
-			StateFile: "/tmp/mxmoused-state",
-			Waybar:    true,
-		},
+		}},
+		AppPresets:    map[string]string{},
+		MetaStateFile: "/tmp/mxmouse-meta-state",
+		WriteWaybar:   false,
 	}
 }
 
-// SearchPaths returns the config locations tried when --config is not given,
-// in the order they are tried.
-func SearchPaths() []string {
-	var paths []string
-	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
-		paths = append(paths, filepath.Join(xdg, "mxmoused", "config.yaml"))
-	} else if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".config", "mxmoused", "config.yaml"))
+func DefaultConfigPath() (string, error) {
+	if dir := os.Getenv("XDG_CONFIG_HOME"); filepath.IsAbs(dir) {
+		return filepath.Join(dir, "mxmouse", "config.json"), nil
 	}
-	paths = append(paths, "/etc/mxmoused/config.yaml")
-	return paths
-}
-
-// Load reads YAML from path, or from SearchPaths() if path is empty. Missing
-// keys fall back to Defaults(). The returned Config is validated.
-func Load(path string) (*Config, error) {
-	cfg := Defaults()
-
-	data, resolved, err := readConfig(path)
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	if data != nil {
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", resolved, err)
+	return filepath.Join(home, ".config", "mxmouse", "config.json"), nil
+}
+
+func Load(path string) (Config, error) {
+	cfg := Defaults()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := cfg.Validate(); err != nil {
+			return Config{}, fmt.Errorf("validate defaults: %w", err)
 		}
+		return cfg, nil
+	}
+	if err != nil {
+		return Config{}, fmt.Errorf("read config %s: %w", path, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return Config{}, fmt.Errorf("parse config %s: trailing JSON value", path)
+		}
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		return Config{}, fmt.Errorf("validate config %s: %w", path, err)
 	}
-	return &cfg, nil
+	return cfg, nil
 }
 
-func readConfig(path string) ([]byte, string, error) {
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, path, fmt.Errorf("read %s: %w", path, err)
-		}
-		return data, path, nil
-	}
-	for _, p := range SearchPaths() {
-		data, err := os.ReadFile(p)
-		if err == nil {
-			return data, p, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, p, fmt.Errorf("read %s: %w", p, err)
-		}
-	}
-	// No config file found — Defaults() alone will be used.
-	return nil, "", nil
-}
-
-func (c *Config) Validate() error {
-	switch c.Mode {
-	case ModeGesture, ModeMetaToggle:
-	default:
-		return fmt.Errorf("unknown mode %q (want %q or %q)",
-			c.Mode, ModeGesture, ModeMetaToggle)
+func (c Config) Validate() error {
+	if c.Version != Version {
+		return fmt.Errorf("unsupported config version %d (expected %d)", c.Version, Version)
 	}
 	if c.Device.TriggerButton == "" {
-		return errors.New("device.trigger_button is required")
+		return errors.New("device.triggerButton is required")
 	}
 	if !c.Device.AutoDetect && c.Device.Path == "" {
-		return errors.New("device.path is required when device.auto_detect is false")
+		return errors.New("device.path is required when autoDetect is false")
 	}
-	if c.Mode == ModeGesture {
-		if c.Gesture.Threshold <= 0 {
-			return errors.New("gesture.threshold must be > 0")
+	if len(c.Presets) == 0 {
+		return errors.New("at least one preset is required")
+	}
+
+	presets := make(map[string]Preset, len(c.Presets))
+	for _, preset := range c.Presets {
+		if preset.ID == "" || preset.Name == "" {
+			return errors.New("every preset requires a non-empty id and name")
 		}
-		if c.Gesture.Escalation < 0 {
-			return errors.New("gesture.escalation must be >= 0")
+		if _, exists := presets[preset.ID]; exists {
+			return fmt.Errorf("duplicate preset id %q", preset.ID)
+		}
+		switch preset.Mode {
+		case ModeGesture:
+			if preset.Threshold <= 0 {
+				return fmt.Errorf("preset %q threshold must be greater than zero", preset.ID)
+			}
+			if preset.Escalation < 0 {
+				return fmt.Errorf("preset %q escalation cannot be negative", preset.ID)
+			}
+		case ModeMetaToggle:
+			if preset.MetaKey == "" {
+				return fmt.Errorf("preset %q metaKey is required in meta-toggle mode", preset.ID)
+			}
+			if !supportedMetaKey(preset.MetaKey) {
+				return fmt.Errorf("preset %q uses unsupported metaKey %q", preset.ID, preset.MetaKey)
+			}
+		default:
+			return fmt.Errorf("preset %q has unsupported mode %q", preset.ID, preset.Mode)
+		}
+		presets[preset.ID] = preset
+	}
+	if _, ok := presets[c.DefaultPresetID]; !ok {
+		return fmt.Errorf("default preset %q does not exist", c.DefaultPresetID)
+	}
+	for appID, presetID := range c.AppPresets {
+		if appID == "" {
+			return errors.New("app preset assignments require a non-empty app_id")
+		}
+		if _, ok := presets[presetID]; !ok {
+			return fmt.Errorf("app_id %q refers to unknown preset %q", appID, presetID)
 		}
 	}
-	if c.Mode == ModeMetaToggle {
-		if c.MetaToggle.Key == "" {
-			return errors.New("meta_toggle.key is required")
-		}
-		if c.MetaToggle.Waybar && c.MetaToggle.StateFile == "" {
-			return errors.New("meta_toggle.state_file is required when meta_toggle.waybar is true")
-		}
+	if c.WriteWaybar && c.MetaStateFile == "" {
+		return errors.New("metaStateFile is required when writeWaybar is enabled")
 	}
 	return nil
+}
+
+func supportedMetaKey(name string) bool {
+	switch name {
+	case "KEY_LEFTMETA", "KEY_RIGHTMETA", "KEY_LEFTCTRL", "KEY_RIGHTCTRL",
+		"KEY_LEFTALT", "KEY_RIGHTALT", "KEY_LEFTSHIFT", "KEY_RIGHTSHIFT":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c Config) PresetForApp(appID string) Preset {
+	presetID := c.AppPresets[appID]
+	for _, preset := range c.Presets {
+		if preset.ID == presetID {
+			return preset
+		}
+	}
+	for _, preset := range c.Presets {
+		if preset.ID == c.DefaultPresetID {
+			return preset
+		}
+	}
+	return c.Presets[0]
 }

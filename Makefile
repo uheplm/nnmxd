@@ -1,60 +1,48 @@
-# Local install / lifecycle for mxmoused.
-#
-# The daemon needs root (evdev grab + uinput), so it runs as a system unit.
-# The binary lives in the user's ~/.local/bin to match configs/mxmoused.service;
-# only the unit file install and systemctl operations need sudo.
-
-BINARY      := mxmoused
+APP         := nnmxd
 BIN_DIR     := $(HOME)/.local/bin
-CONFIG_DIR  := $(HOME)/.config/mxmoused
-CONFIG_FILE := $(CONFIG_DIR)/config.yaml
-UNIT_NAME   := mxmoused.service
-UNIT_DIR    := /etc/systemd/system
-UNIT_SRC    := configs/mxmoused.service
-EXAMPLE_CFG := configs/mxmoused.example.yaml
+UNIT_DIR    := $(HOME)/.config/systemd/user
+UNIT_NAME   := nnmxd.service
+UNIT_SOURCE := configs/nnmxd.service
+GO          ?= go
 
-GO    ?= go
-SUDO  ?= sudo
-
-.PHONY: build test install reinstall restart stop start status logs uninstall
+.PHONY: build test install reinstall enable restart stop start status logs uninstall
 
 build:
-	$(GO) build -o bin/$(BINARY) ./cmd/$(BINARY)
+	mkdir -p bin
+	$(GO) build -o bin/$(APP) ./cmd/$(APP)
 
 test:
 	$(GO) test ./...
 
-# Full install: binary + config seed + systemd unit + enable & start.
 install: build
-	install -Dm0755 bin/$(BINARY) $(BIN_DIR)/$(BINARY)
-	install -d $(CONFIG_DIR)
-	[ -f $(CONFIG_FILE) ] || install -m0644 $(EXAMPLE_CFG) $(CONFIG_FILE)
-	$(SUDO) install -Dm0644 $(UNIT_SRC) $(UNIT_DIR)/$(UNIT_NAME)
-	$(SUDO) systemctl daemon-reload
-	$(SUDO) systemctl enable --now $(UNIT_NAME)
+	install -Dm0755 bin/$(APP) $(BIN_DIR)/$(APP)
+	install -Dm0644 $(UNIT_SOURCE) $(UNIT_DIR)/$(UNIT_NAME)
+	systemctl --user daemon-reload
+	systemctl --user enable --now $(UNIT_NAME)
 
-# Rebuild + swap binary + restart. Use this for the edit-rebuild-test loop.
 reinstall: build
-	install -Dm0755 bin/$(BINARY) $(BIN_DIR)/$(BINARY)
-	$(SUDO) systemctl restart $(UNIT_NAME)
+	install -Dm0755 bin/$(APP) $(BIN_DIR)/$(APP)
+	systemctl --user restart $(UNIT_NAME)
+
+enable:
+	systemctl --user enable --now $(UNIT_NAME)
 
 restart:
-	$(SUDO) systemctl restart $(UNIT_NAME)
+	systemctl --user restart $(UNIT_NAME)
 
 stop:
-	$(SUDO) systemctl stop $(UNIT_NAME)
+	systemctl --user stop $(UNIT_NAME)
 
 start:
-	$(SUDO) systemctl start $(UNIT_NAME)
+	systemctl --user start $(UNIT_NAME)
 
 status:
-	systemctl status $(UNIT_NAME) --no-pager
+	systemctl --user status $(UNIT_NAME) --no-pager
 
 logs:
-	journalctl -u $(UNIT_NAME) -f
+	journalctl --user -u $(UNIT_NAME) -f
 
 uninstall:
-	-$(SUDO) systemctl disable --now $(UNIT_NAME)
-	-$(SUDO) rm -f $(UNIT_DIR)/$(UNIT_NAME)
-	$(SUDO) systemctl daemon-reload
-	-rm -f $(BIN_DIR)/$(BINARY)
+	-systemctl --user disable --now $(UNIT_NAME)
+	rm -f $(UNIT_DIR)/$(UNIT_NAME) $(BIN_DIR)/$(APP)
+	systemctl --user daemon-reload
