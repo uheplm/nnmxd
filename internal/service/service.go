@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,24 +19,27 @@ import (
 	"github.com/uheplm/nnmxd/internal/config"
 	"github.com/uheplm/nnmxd/internal/device"
 	"github.com/uheplm/nnmxd/internal/gesture"
+	"github.com/uheplm/nnmxd/internal/hidpp"
 	"github.com/uheplm/nnmxd/internal/niri"
 )
 
 type Status struct {
-	Running     bool   `json:"running"`
-	Device      string `json:"device"`
-	Mode        string `json:"mode"`
-	AppID       string `json:"appId"`
-	PresetID    string `json:"presetId"`
-	PresetName  string `json:"presetName"`
-	MetaOn      bool   `json:"metaOn"`
-	LastError   string `json:"lastError"`
-	UpdatedUnix int64  `json:"updatedUnix"`
+	Running           bool   `json:"running"`
+	Device            string `json:"device"`
+	Mode              string `json:"mode"`
+	AppID             string `json:"appId"`
+	PresetID          string `json:"presetId"`
+	PresetName        string `json:"presetName"`
+	MetaOn            bool   `json:"metaOn"`
+	LastError         string `json:"lastError"`
+	AppliedGeneration int    `json:"appliedGeneration"`
+	UpdatedUnix       int64  `json:"updatedUnix"`
 }
 
 type reporter struct {
-	path string
-	data Status
+	path              string
+	data              Status
+	appliedGeneration int
 }
 
 type waybarState struct {
@@ -44,6 +50,7 @@ type waybarState struct {
 }
 
 func (r *reporter) update() {
+	r.data.AppliedGeneration = r.appliedGeneration
 	r.data.UpdatedUnix = time.Now().Unix()
 	data, err := json.Marshal(r.data)
 	if err != nil {
@@ -85,7 +92,10 @@ func (r *reporter) update() {
 }
 
 func Run(ctx context.Context, configPath, statusPath string) error {
-	status := &reporter{path: statusPath}
+	status := &reporter{
+		path:              statusPath,
+		appliedGeneration: previousAppliedGeneration(configPath, statusPath),
+	}
 	defer func() {
 		status.data = Status{}
 		status.update()
@@ -140,6 +150,27 @@ func runDevice(
 	if !ok {
 		return fmt.Errorf("unknown trigger button %q", initial.Device.TriggerButton)
 	}
+	appliedDPI := 0
+	applyDPI := func(dpi int) error {
+		if dpi == 0 {
+			log.Printf("DPI setting is 0; leaving hardware DPI unchanged")
+			appliedDPI = 0
+			return nil
+		}
+		log.Printf("attempting to set mouse DPI to %d (last confirmed value: %d)", dpi, appliedDPI)
+		if err := hidpp.SetDPI(dev.Path(), dpi); err != nil {
+			log.Printf("set mouse DPI to %d failed: %v", dpi, err)
+			return err
+		}
+		appliedDPI = dpi
+		log.Printf("set mouse DPI to %d", dpi)
+		return nil
+	}
+	if err := applyDPI(initial.Device.DPI); err != nil {
+		status.data.LastError = err.Error()
+		log.Printf("set mouse DPI: %v", err)
+		status.update()
+	}
 	if err := dev.Grab(); err != nil {
 		return fmt.Errorf("grab device: %w", err)
 	}
@@ -172,6 +203,8 @@ func runDevice(
 	var engine *gesture.Engine
 	gestureActive := false
 	pressedMeta := map[evdev.EvCode]bool{}
+	wheelRemainders := map[evdev.EvCode]float64{}
+	suppressTriggerRelease := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,6 +222,9 @@ func runDevice(
 			if event.Type == evdev.EV_KEY && event.Code == triggerCode {
 				switch event.Value {
 				case 1:
+					suppressTriggerRelease = false
+					previousGeneration := status.appliedGeneration
+					previousDPI := currentConfig.Device.DPI
 					loaded, loadErr := config.Load(configPath)
 					if loadErr != nil {
 						status.data.LastError = loadErr.Error()
@@ -197,43 +233,84 @@ func runDevice(
 						currentConfig = loaded
 						status.data.LastError = ""
 					}
+					suppressTriggerRelease = loadErr == nil &&
+						shouldSuppressTrigger(loaded.ApplyGeneration, status.appliedGeneration)
+					log.Printf(
+						"thumb-button press: config generation %d (applied %d), DPI request %d (previous config request %d, last confirmed %d)",
+						currentConfig.ApplyGeneration,
+						previousGeneration,
+						currentConfig.Device.DPI,
+						previousDPI,
+						appliedDPI,
+					)
+					if suppressTriggerRelease {
+						log.Printf(
+							"consuming thumb-button press for config generation %d; assigned action will be skipped",
+							loaded.ApplyGeneration,
+						)
+						if err := storeAppliedGeneration(configPath, loaded.ApplyGeneration); err != nil {
+							status.data.LastError = fmt.Sprintf("record applied config generation: %v", err)
+							log.Printf("record applied config generation: %v", err)
+						} else {
+							status.appliedGeneration = loaded.ApplyGeneration
+						}
+					}
+					if currentConfig.Device.DPI != appliedDPI {
+						apply := func() error { return applyDPI(currentConfig.Device.DPI) }
+						var applyErr error
+						if suppressTriggerRelease {
+							applyErr = retryDPIApply(apply, 3, 250*time.Millisecond)
+						} else {
+							applyErr = apply()
+						}
+						if applyErr != nil {
+							status.data.LastError = applyErr.Error()
+						} else {
+							status.data.LastError = ""
+						}
+					}
 					if currentConfig.Device.TriggerButton != initial.Device.TriggerButton ||
 						currentConfig.Device.Path != initial.Device.Path ||
 						currentConfig.Device.AutoDetect != initial.Device.AutoDetect {
 						status.data.LastError = "input-device settings changed; restart the user service to apply them"
 					}
-					focusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-					appID, appErr := niriClient.FocusedAppID(focusCtx)
-					cancel()
-					if appErr != nil {
-						status.data.LastError = appErr.Error()
-						appID = ""
-					}
-					preset := currentConfig.PresetForApp(appID)
-					status.data.AppID = appID
-					status.data.PresetID = preset.ID
-					status.data.PresetName = preset.Name
-					status.data.Mode = string(preset.Mode)
-
-					if preset.Mode == config.ModeMetaToggle {
-						gestureActive = false
-						key, exists := evdev.KEYFromString[preset.MetaKey]
-						if !exists {
-							status.data.LastError = fmt.Sprintf("unknown meta key %q", preset.MetaKey)
-						} else if err := toggleKey(keyboard, key, pressedMeta); err != nil {
-							status.data.LastError = err.Error()
+					if !suppressTriggerRelease {
+						focusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+						appID, appErr := niriClient.FocusedAppID(focusCtx)
+						cancel()
+						if appErr != nil {
+							status.data.LastError = appErr.Error()
+							appID = ""
 						}
-						forward(clone, event)
-					} else {
-						gestureActive = true
-						engine = newEngine(preset)
-						_ = engine.Step(gesture.Input{Kind: gesture.ButtonPress})
+						preset := currentConfig.PresetForApp(appID)
+						status.data.AppID = appID
+						status.data.PresetID = preset.ID
+						status.data.PresetName = preset.Name
+						status.data.Mode = string(preset.Mode)
+
+						if preset.Mode == config.ModeMetaToggle {
+							gestureActive = false
+							key, exists := evdev.KEYFromString[preset.MetaKey]
+							if !exists {
+								status.data.LastError = fmt.Sprintf("unknown meta key %q", preset.MetaKey)
+							} else if err := toggleKey(keyboard, key, pressedMeta); err != nil {
+								status.data.LastError = err.Error()
+							}
+							forward(clone, event)
+						} else {
+							gestureActive = true
+							engine = newEngine(preset)
+							_ = engine.Step(gesture.Input{Kind: gesture.ButtonPress})
+						}
 					}
 					status.data.MetaOn = len(pressedMeta) > 0
 					writeMetaState(currentConfig, status.data.MetaOn)
 					status.update()
 				case 0:
-					if gestureActive && engine != nil {
+					if suppressTriggerRelease {
+						log.Printf("thumb-button release consumed after config apply; assigned action was skipped")
+						suppressTriggerRelease = false
+					} else if gestureActive && engine != nil {
 						dispatchActions(niriClient, engine.Step(gesture.Input{Kind: gesture.ButtonRelease}))
 						gestureActive = false
 					} else {
@@ -255,18 +332,136 @@ func runDevice(
 				}
 				continue
 			}
+			if event.Type == evdev.EV_REL {
+				if percent, ok := wheelScale(event.Code, currentConfig.Device); ok {
+					scaled := *event
+					scaled.Value = scaleWheelValue(event.Code, event.Value, percent, wheelRemainders)
+					if scaled.Value != 0 {
+						forward(clone, &scaled)
+					}
+					continue
+				}
+			}
 			forward(clone, event)
 		}
 	}
 }
 
+func shouldSuppressTrigger(generation, appliedGeneration int) bool {
+	return generation > appliedGeneration
+}
+
+func retryDPIApply(apply func() error, attempts int, delay time.Duration) error {
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = apply()
+		if err == nil {
+			return nil
+		}
+		if attempt < attempts {
+			log.Printf("retrying DPI apply during config confirmation (%d/%d): %v", attempt+1, attempts, err)
+			time.Sleep(delay)
+		}
+	}
+	return err
+}
+
+func previousAppliedGeneration(configPath, statusPath string) int {
+	state, err := os.ReadFile(configPath + ".applied-generation")
+	if err == nil {
+		generation, parseErr := strconv.Atoi(strings.TrimSpace(string(state)))
+		if parseErr != nil || generation < 0 {
+			log.Printf("parse applied config generation: invalid state file contents")
+		} else {
+			return generation
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("read applied config generation: %v", err)
+	}
+
+	data, err := os.ReadFile(statusPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		log.Printf("read previous service status: %v", err)
+		return 0
+	}
+	var previous Status
+	if err := json.Unmarshal(data, &previous); err != nil {
+		log.Printf("parse previous service status: %v", err)
+		return 0
+	}
+	if previous.AppliedGeneration < 0 {
+		log.Printf("previous service status has a negative applied generation")
+		return 0
+	}
+	return previous.AppliedGeneration
+}
+
+func storeAppliedGeneration(configPath string, generation int) error {
+	path := configPath + ".applied-generation"
+	temp, err := os.CreateTemp(filepath.Dir(path), ".applied-generation-*")
+	if err != nil {
+		return fmt.Errorf("create applied-generation state: %w", err)
+	}
+	tempPath := temp.Name()
+	if _, err := fmt.Fprintln(temp, generation); err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("write applied-generation state: %w", err)
+	}
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("secure applied-generation state: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("close applied-generation state: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("publish applied-generation state: %w", err)
+	}
+	return nil
+}
+
+func wheelScale(code evdev.EvCode, settings config.Device) (int, bool) {
+	switch code {
+	case evdev.EvCode(0x06), evdev.EvCode(0x0c):
+		return settings.HorizontalScroll, true
+	case evdev.EvCode(0x08), evdev.EvCode(0x0b):
+		return settings.VerticalScroll, true
+	default:
+		return 0, false
+	}
+}
+
+func scaleWheelValue(code evdev.EvCode, value int32, percent int, remainders map[evdev.EvCode]float64) int32 {
+	if percent == 100 {
+		remainders[code] = 0
+		return value
+	}
+	scaled := float64(value)*float64(percent)/100 + remainders[code]
+	result := int32(scaled)
+	remainders[code] = scaled - float64(result)
+	return result
+}
+
 func newEngine(preset config.Preset) *gesture.Engine {
-	return gesture.New(preset.Threshold, preset.Escalation, gesture.Bindings{
-		Left: preset.Bindings.Left, Right: preset.Bindings.Right,
-		Up: preset.Bindings.Up, Down: preset.Bindings.Down,
-		Tap: preset.Bindings.Tap, ScrollUp: preset.Bindings.ScrollUp,
-		ScrollDown: preset.Bindings.ScrollDown,
+	return gesture.New(preset.Threshold, preset.RetriggerDistance, preset.Escalation, gesture.Bindings{
+		Left: gestureBinding(preset.Bindings.Left), Right: gestureBinding(preset.Bindings.Right),
+		Up: gestureBinding(preset.Bindings.Up), Down: gestureBinding(preset.Bindings.Down),
+		Tap: gestureBinding(preset.Bindings.Tap), ScrollUp: gestureBinding(preset.Bindings.ScrollUp),
+		ScrollDown: gestureBinding(preset.Bindings.ScrollDown),
 	})
+}
+
+func gestureBinding(binding config.Binding) gesture.Action {
+	return gesture.Action{
+		Type: binding.Type, Value: binding.Value, Arguments: binding.Arguments,
+	}
 }
 
 func supportedMetaKeys() []evdev.EvCode {
@@ -330,10 +525,48 @@ func writeMetaState(cfg config.Config, on bool) {
 	}
 }
 
-func dispatchActions(client *niri.Client, actions []string) {
+func dispatchActions(client *niri.Client, actions []gesture.Action) {
 	for _, action := range actions {
-		client.Action(action)
+		log.Printf("dispatching %s gesture action: %s", action.Type, action.Value)
+		switch action.Type {
+		case "niri":
+			client.Action(action.Value, strings.Fields(action.Arguments)...)
+		case "noctalia":
+			runGestureCommand("noctalia", noctaliaGestureArgs(action))
+		case "command":
+			command := strings.TrimSpace(action.Value + " " + action.Arguments)
+			runGestureShell(command)
+		default:
+			log.Printf("unsupported gesture action type %q", action.Type)
+		}
 	}
+}
+
+func noctaliaGestureArgs(action gesture.Action) []string {
+	args := append([]string{"msg"}, strings.Fields(action.Value)...)
+	return append(args, strings.Fields(action.Arguments)...)
+}
+
+func runGestureCommand(name string, args []string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+		if err != nil {
+			log.Printf("%s gesture command failed: %v: %s", name, err, strings.TrimSpace(string(output)))
+		}
+	}()
+}
+
+func runGestureShell(command string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, "sh", "-c", command).CombinedOutput()
+		if err != nil {
+			log.Printf("custom gesture command failed: %v: %s", err, strings.TrimSpace(string(output)))
+		}
+	}()
 }
 
 func forward(clone *evdev.InputDevice, event *evdev.InputEvent) {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,10 @@ func TestDefaultsValidateAndSelectAppPreset(t *testing.T) {
 	cfg := Defaults()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("defaults invalid: %v", err)
+	}
+	if cfg.Presets[0].Threshold != 100 || cfg.Presets[0].RetriggerDistance != 100 || cfg.Presets[0].Escalation != 0 {
+		t.Fatalf("default gesture distances = (%d, %d, %d), want (100, 100, 0)",
+			cfg.Presets[0].Threshold, cfg.Presets[0].RetriggerDistance, cfg.Presets[0].Escalation)
 	}
 	if got := cfg.PresetForApp("org.example.App").ID; got != "default" {
 		t.Fatalf("fallback preset = %q, want default", got)
@@ -49,6 +54,32 @@ func TestValidationRejectsUnknownPresetAssignment(t *testing.T) {
 	}
 }
 
+func TestValidationRejectsNegativeApplyGeneration(t *testing.T) {
+	cfg := Defaults()
+	cfg.ApplyGeneration = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate succeeded with a negative apply generation")
+	}
+}
+
+func TestValidationRejectsInvalidDPIAndScrollScales(t *testing.T) {
+	tests := map[string]func(*Config){
+		"dpi below supported range":     func(cfg *Config) { cfg.Device.DPI = 50 },
+		"dpi above supported range":     func(cfg *Config) { cfg.Device.DPI = 16001 },
+		"vertical scroll below range":   func(cfg *Config) { cfg.Device.VerticalScroll = 9 },
+		"horizontal scroll above range": func(cfg *Config) { cfg.Device.HorizontalScroll = 501 },
+	}
+	for name, modify := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := Defaults()
+			modify(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate succeeded with invalid device settings")
+			}
+		})
+	}
+}
+
 func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	cfg, err := Load(filepath.Join(t.TempDir(), "missing.json"))
 	if err != nil {
@@ -56,5 +87,97 @@ func TestLoadMissingConfigUsesDefaults(t *testing.T) {
 	}
 	if cfg.DefaultPresetID != "default" {
 		t.Fatalf("default preset = %q", cfg.DefaultPresetID)
+	}
+}
+
+func TestLoadLegacyPresetDefaultsRetriggerDistanceToThreshold(t *testing.T) {
+	cfg := Defaults()
+	cfg.Presets[0].Threshold = 175
+	cfg.Presets[0].Escalation = 0
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	var presets []map[string]json.RawMessage
+	if err := json.Unmarshal(document["presets"], &presets); err != nil {
+		t.Fatal(err)
+	}
+	delete(presets[0], "retriggerDistance")
+	document["presets"], err = json.Marshal(presets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Presets[0].RetriggerDistance != 175 {
+		t.Fatalf("legacy retrigger distance = %d, want threshold 175", loaded.Presets[0].RetriggerDistance)
+	}
+}
+
+func TestLoadPreservesApplyGeneration(t *testing.T) {
+	cfg := Defaults()
+	cfg.ApplyGeneration = 3
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ApplyGeneration != 3 {
+		t.Fatalf("apply generation = %d, want 3", loaded.ApplyGeneration)
+	}
+}
+
+func TestLoadPreservesPresetGlyph(t *testing.T) {
+	cfg := Defaults()
+	cfg.Presets[0].Glyph = "device-gamepad-2"
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Presets[0].Glyph != "device-gamepad-2" {
+		t.Fatalf("preset glyph = %q, want device-gamepad-2", loaded.Presets[0].Glyph)
+	}
+}
+
+func TestLoadLegacyDeviceSettingsUseNeutralScalingDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"device":{"autoDetect":true,"triggerButton":"BTN_FORWARD"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Device.DPI != 0 || cfg.Device.VerticalScroll != 100 || cfg.Device.HorizontalScroll != 100 {
+		t.Fatalf("legacy device defaults = %#v", cfg.Device)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const Version = 1
@@ -20,33 +21,72 @@ const (
 )
 
 type Device struct {
-	AutoDetect    bool   `json:"autoDetect"`
-	Path          string `json:"path"`
-	TriggerButton string `json:"triggerButton"`
+	AutoDetect       bool   `json:"autoDetect"`
+	Path             string `json:"path"`
+	TriggerButton    string `json:"triggerButton"`
+	DPI              int    `json:"dpi"`
+	VerticalScroll   int    `json:"verticalScroll"`
+	HorizontalScroll int    `json:"horizontalScroll"`
+}
+
+type Binding struct {
+	Type      string `json:"type"`
+	Value     string `json:"value"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+func (b *Binding) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err == nil {
+		b.Type = "niri"
+		b.Value, b.Arguments, _ = strings.Cut(strings.TrimSpace(value), " ")
+		return nil
+	}
+	type bindingAlias Binding
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var parsed bindingAlias
+	if err := decoder.Decode(&parsed); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value in action binding")
+		}
+		return err
+	}
+	if parsed.Type == "" {
+		parsed.Type = "niri"
+	}
+	*b = Binding(parsed)
+	return nil
 }
 
 type Bindings struct {
-	Left       string `json:"left"`
-	Right      string `json:"right"`
-	Up         string `json:"up"`
-	Down       string `json:"down"`
-	Tap        string `json:"tap"`
-	ScrollUp   string `json:"scrollUp"`
-	ScrollDown string `json:"scrollDown"`
+	Left       Binding `json:"left"`
+	Right      Binding `json:"right"`
+	Up         Binding `json:"up"`
+	Down       Binding `json:"down"`
+	Tap        Binding `json:"tap"`
+	ScrollUp   Binding `json:"scrollUp"`
+	ScrollDown Binding `json:"scrollDown"`
 }
 
 type Preset struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Mode       Mode     `json:"mode"`
-	Threshold  int      `json:"threshold"`
-	Escalation int      `json:"escalation"`
-	MetaKey    string   `json:"metaKey"`
-	Bindings   Bindings `json:"bindings"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Mode              Mode     `json:"mode"`
+	Glyph             string   `json:"glyph,omitempty"`
+	Threshold         int      `json:"threshold"`
+	RetriggerDistance int      `json:"retriggerDistance"`
+	Escalation        int      `json:"escalation"`
+	MetaKey           string   `json:"metaKey"`
+	Bindings          Bindings `json:"bindings"`
 }
 
 type Config struct {
 	Version         int               `json:"version"`
+	ApplyGeneration int               `json:"applyGeneration"`
 	Device          Device            `json:"device"`
 	DefaultPresetID string            `json:"defaultPresetId"`
 	Presets         []Preset          `json:"presets"`
@@ -59,25 +99,29 @@ func Defaults() Config {
 	return Config{
 		Version: Version,
 		Device: Device{
-			AutoDetect:    true,
-			TriggerButton: "BTN_FORWARD",
+			AutoDetect:       true,
+			TriggerButton:    "BTN_FORWARD",
+			VerticalScroll:   100,
+			HorizontalScroll: 100,
 		},
 		DefaultPresetID: "default",
 		Presets: []Preset{{
-			ID:         "default",
-			Name:       "Default",
-			Mode:       ModeGesture,
-			Threshold:  100,
-			Escalation: 250,
-			MetaKey:    "KEY_LEFTMETA",
+			ID:                "default",
+			Name:              "Default",
+			Mode:              ModeGesture,
+			Glyph:             "arrows-move",
+			Threshold:         100,
+			RetriggerDistance: 100,
+			Escalation:        0,
+			MetaKey:           "KEY_LEFTMETA",
 			Bindings: Bindings{
-				Left:       "focus-column-left",
-				Right:      "focus-column-right",
-				Up:         "focus-workspace-up",
-				Down:       "focus-workspace-down",
-				Tap:        "toggle-overview",
-				ScrollUp:   "focus-workspace-up",
-				ScrollDown: "focus-workspace-down",
+				Left:       Binding{Type: "niri", Value: "focus-column-left"},
+				Right:      Binding{Type: "niri", Value: "focus-column-right"},
+				Up:         Binding{Type: "niri", Value: "focus-workspace-up"},
+				Down:       Binding{Type: "niri", Value: "focus-workspace-down"},
+				Tap:        Binding{Type: "niri", Value: "toggle-overview"},
+				ScrollUp:   Binding{Type: "niri", Value: "focus-workspace-up"},
+				ScrollDown: Binding{Type: "niri", Value: "focus-workspace-down"},
 			},
 		}},
 		AppPresets:    map[string]string{},
@@ -120,6 +164,19 @@ func Load(path string) (Config, error) {
 		}
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	var rawConfig struct {
+		Presets []map[string]json.RawMessage `json:"presets"`
+	}
+	if err := json.Unmarshal(data, &rawConfig); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	for i := range cfg.Presets {
+		if i < len(rawConfig.Presets) {
+			if _, exists := rawConfig.Presets[i]["retriggerDistance"]; !exists {
+				cfg.Presets[i].RetriggerDistance = cfg.Presets[i].Threshold
+			}
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate config %s: %w", path, err)
 	}
@@ -130,11 +187,23 @@ func (c Config) Validate() error {
 	if c.Version != Version {
 		return fmt.Errorf("unsupported config version %d (expected %d)", c.Version, Version)
 	}
+	if c.ApplyGeneration < 0 {
+		return errors.New("applyGeneration cannot be negative")
+	}
 	if c.Device.TriggerButton == "" {
 		return errors.New("device.triggerButton is required")
 	}
 	if !c.Device.AutoDetect && c.Device.Path == "" {
 		return errors.New("device.path is required when autoDetect is false")
+	}
+	if c.Device.DPI != 0 && (c.Device.DPI < 100 || c.Device.DPI > 16000) {
+		return errors.New("device.dpi must be 0 (unchanged) or between 100 and 16000")
+	}
+	if c.Device.VerticalScroll < 10 || c.Device.VerticalScroll > 500 {
+		return errors.New("device.verticalScroll must be between 10 and 500")
+	}
+	if c.Device.HorizontalScroll < 10 || c.Device.HorizontalScroll > 500 {
+		return errors.New("device.horizontalScroll must be between 10 and 500")
 	}
 	if len(c.Presets) == 0 {
 		return errors.New("at least one preset is required")
@@ -153,6 +222,9 @@ func (c Config) Validate() error {
 			if preset.Threshold <= 0 {
 				return fmt.Errorf("preset %q threshold must be greater than zero", preset.ID)
 			}
+			if preset.RetriggerDistance <= 0 {
+				return fmt.Errorf("preset %q retriggerDistance must be greater than zero", preset.ID)
+			}
 			if preset.Escalation < 0 {
 				return fmt.Errorf("preset %q escalation cannot be negative", preset.ID)
 			}
@@ -165,6 +237,16 @@ func (c Config) Validate() error {
 			}
 		default:
 			return fmt.Errorf("preset %q has unsupported mode %q", preset.ID, preset.Mode)
+		}
+		for name, binding := range map[string]Binding{
+			"left": preset.Bindings.Left, "right": preset.Bindings.Right,
+			"up": preset.Bindings.Up, "down": preset.Bindings.Down,
+			"tap": preset.Bindings.Tap, "scrollUp": preset.Bindings.ScrollUp,
+			"scrollDown": preset.Bindings.ScrollDown,
+		} {
+			if binding.Value != "" && binding.Type != "niri" && binding.Type != "noctalia" && binding.Type != "command" {
+				return fmt.Errorf("preset %q binding %q has unsupported type %q", preset.ID, name, binding.Type)
+			}
 		}
 		presets[preset.ID] = preset
 	}

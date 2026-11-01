@@ -16,31 +16,40 @@ type Input struct {
 }
 
 type Bindings struct {
-	Left, Right, Up, Down     string
-	Tap, ScrollUp, ScrollDown string
+	Left, Right, Up, Down     Action
+	Tap, ScrollUp, ScrollDown Action
+}
+
+type Action struct {
+	Type      string
+	Value     string
+	Arguments string
 }
 
 type Engine struct {
-	threshold, escalation int
-	bindings              Bindings
-	active, used          bool
-	step, x, y            int
+	threshold, retriggerDistance, escalation int
+	bindings                                 Bindings
+	active, used                             bool
+	step, x, y                               int
 }
 
-func New(threshold, escalation int, bindings Bindings) *Engine {
-	return &Engine{threshold: threshold, escalation: escalation, bindings: bindings}
+func New(threshold, retriggerDistance, escalation int, bindings Bindings) *Engine {
+	return &Engine{
+		threshold: threshold, retriggerDistance: retriggerDistance, escalation: escalation,
+		bindings: bindings,
+	}
 }
 
 func (e *Engine) Active() bool { return e.active }
 
-func (e *Engine) Step(input Input) []string {
+func (e *Engine) Step(input Input) []Action {
 	switch input.Kind {
 	case ButtonPress:
 		e.active, e.used = true, false
 		e.step, e.x, e.y = 0, 0, 0
 	case ButtonRelease:
-		var actions []string
-		if !e.used && e.bindings.Tap != "" {
+		var actions []Action
+		if !e.used && e.bindings.Tap.Value != "" {
 			actions = append(actions, e.bindings.Tap)
 		}
 		e.active, e.used = false, false
@@ -61,46 +70,49 @@ func (e *Engine) Step(input Input) []string {
 			return nil
 		}
 		switch {
-		case input.Value > 0 && e.bindings.ScrollUp != "":
+		case input.Value > 0 && e.bindings.ScrollUp.Value != "":
 			e.used = true
-			return []string{e.bindings.ScrollUp}
-		case input.Value < 0 && e.bindings.ScrollDown != "":
+			return []Action{e.bindings.ScrollUp}
+		case input.Value < 0 && e.bindings.ScrollDown.Value != "":
 			e.used = true
-			return []string{e.bindings.ScrollDown}
+			return []Action{e.bindings.ScrollDown}
 		}
 	}
 	return nil
 }
 
 func (e *Engine) thresholdForStep() int {
-	return e.threshold + e.step*e.escalation
+	if e.step == 0 {
+		return e.threshold
+	}
+	return e.retriggerDistance + e.step*e.escalation
 }
 
-func (e *Engine) horizontal() []string {
+func (e *Engine) horizontal() []Action {
 	threshold := e.thresholdForStep()
 	switch {
-	case e.x >= threshold && e.bindings.Right != "":
+	case e.x >= threshold && e.bindings.Right.Value != "":
 		return e.fire(e.bindings.Right)
-	case e.x <= -threshold && e.bindings.Left != "":
+	case e.x <= -threshold && e.bindings.Left.Value != "":
 		return e.fire(e.bindings.Left)
 	}
 	return nil
 }
 
-func (e *Engine) vertical() []string {
+func (e *Engine) vertical() []Action {
 	threshold := e.thresholdForStep()
 	switch {
-	case e.y >= threshold && e.bindings.Down != "":
+	case e.y >= threshold && e.bindings.Down.Value != "":
 		return e.fire(e.bindings.Down)
-	case e.y <= -threshold && e.bindings.Up != "":
+	case e.y <= -threshold && e.bindings.Up.Value != "":
 		return e.fire(e.bindings.Up)
 	}
 	return nil
 }
 
-func (e *Engine) fire(action string) []string {
+func (e *Engine) fire(action Action) []Action {
 	e.used = true
 	e.step++
 	e.x, e.y = 0, 0
-	return []string{action}
+	return []Action{action}
 }
