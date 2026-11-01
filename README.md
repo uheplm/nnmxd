@@ -6,9 +6,10 @@ The companion `ffngs/mxmouse` Noctalia plugin provides a panel for service statu
 
 ## Features
 
-- Hold the configured thumb button and move to dispatch directional Niri actions. The movement threshold controls the first action; retrigger distance controls movement between later actions and defaults to the threshold. Escalation adds to that distance after each retrigger and defaults to 0.
+- Hold the configured thumb button and move to dispatch the configured per-gesture action. Reversing direction clears the accumulated movement for that axis. The movement threshold controls the first action; retrigger distance controls movement between later actions and defaults to the threshold. Escalation adds to that distance after each retrigger and defaults to 0.
 - Tap the button to dispatch the preset's tap action.
-- Hold and scroll to dispatch scroll-up/down actions.
+- Hold and scroll to dispatch configured scroll-up/down actions.
+- Gesture bindings can invoke Niri actions, Noctalia `msg` commands, or custom shell commands.
 - Presets can use gesture or meta-toggle mode. Meta-toggle injects a configured modifier key on each press and releases all held virtual keys when the service stops.
 - Assign a preset to each exact Niri `app_id`; all other apps use the configured default preset.
 - The pointer device is grabbed while the service runs and all non-gesture events are forwarded through a virtual clone.
@@ -58,6 +59,8 @@ make uninstall
 
 The service writes its runtime status to `$XDG_RUNTIME_DIR/mxmouse/status.json`. Its configuration is stored in `$XDG_CONFIG_HOME/mxmouse/config.json`, or `~/.config/mxmouse/config.json` when `XDG_CONFIG_HOME` is unset. These paths retain the MX Mouse product namespace. The Noctalia panel writes configuration through nnmxd's validated, atomic `--apply-config` operation. After a panel save, press the thumb button once to apply it; nnmxd consumes that press without running its gesture or toggle action and reports the applied generation in runtime status. Changing device detection, device path, or trigger button still requires restarting the service.
 
+The MX Mouse Noctalia plugin includes a bar widget that reads the daemon's runtime status and displays the latched modifier state. nnmxd itself has no Waybar-specific output or integration.
+
 The Noctalia plugin can install nnmxd from source into `~/.local/src/nnmxd` by running `make install`. This compiles on the user's machine and downloads Go module dependencies through Go; no compiled dependency bundle is shipped. To install manually:
 
 ```sh
@@ -79,7 +82,7 @@ Install `ffngs/mxmouse` from the community catalog. If nnmxd is missing, the pan
 noctalia msg panel-toggle ffngs/mxmouse:manager
 ```
 
-Create and edit presets in the panel. Choose gesture or meta-toggle mode; gesture bindings are Niri action names, such as `focus-column-left` or `toggle-overview`. In the per-application list, **Next preset** cycles between the default and named presets for that exact app ID. Set DPI to `0` to leave the current hardware setting unchanged, or choose a supported DPI value; scroll scales are independently adjustable by axis. Use **Save configuration** to validate and write changes. Use **Restart input service** after changing device options.
+Create and edit presets in the panel. Choose gesture or meta-toggle mode; for each gesture, choose a Niri action, Noctalia `msg` command, or custom shell command. The action pickers load options from `niri msg action` and `noctalia msg --help`; optional arguments are appended after the selected action. Custom shell commands run as the user and can execute arbitrary programs, so only bind commands you trust. In the per-application list, **Next preset** cycles between the default and named presets for that exact app ID. Use **Save configuration** to validate and write changes. Use **Restart input service** after changing device options.
 
 The focused `app_id` comes from `niri msg --json windows`. Window title is displayed for identification but does not participate in preset matching. Niri and nnmxd must both be installed; the daemon is normally installed at `~/.local/bin/nnmxd`.
 

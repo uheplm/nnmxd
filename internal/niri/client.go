@@ -54,15 +54,20 @@ func (c *Client) FocusedAppID(ctx context.Context) (string, error) {
 	return "", errors.New("Niri reports no focused window")
 }
 
-func (c *Client) Action(name string, args ...string) {
-	if strings.TrimSpace(name) == "" {
+func (c *Client) Action(name string) {
+	c.ActionArgs([]string{name})
+}
+
+func (c *Client) ActionArgs(args []string) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return
 	}
+	args = append([]string(nil), args...)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := c.command(ctx, append([]string{"action", name}, args...)...); err != nil {
-			fmt.Fprintf(os.Stderr, "niri action %q failed: %v\n", name, err)
+		if _, err := c.command(ctx, append([]string{"action"}, args...)...); err != nil {
+			fmt.Fprintf(os.Stderr, "niri action %q failed: %v\n", strings.Join(args, " "), err)
 		}
 	}()
 }

@@ -1,5 +1,7 @@
 package gesture
 
+import "github.com/uheplm/nnmxd/internal/config"
+
 type InputKind uint8
 
 const (
@@ -16,14 +18,8 @@ type Input struct {
 }
 
 type Bindings struct {
-	Left, Right, Up, Down     Action
-	Tap, ScrollUp, ScrollDown Action
-}
-
-type Action struct {
-	Type      string
-	Value     string
-	Arguments string
+	Left, Right, Up, Down     config.Action
+	Tap, ScrollUp, ScrollDown config.Action
 }
 
 type Engine struct {
@@ -42,13 +38,13 @@ func New(threshold, retriggerDistance, escalation int, bindings Bindings) *Engin
 
 func (e *Engine) Active() bool { return e.active }
 
-func (e *Engine) Step(input Input) []Action {
+func (e *Engine) Step(input Input) []config.Action {
 	switch input.Kind {
 	case ButtonPress:
 		e.active, e.used = true, false
 		e.step, e.x, e.y = 0, 0, 0
 	case ButtonRelease:
-		var actions []Action
+		var actions []config.Action
 		if !e.used && e.bindings.Tap.Value != "" {
 			actions = append(actions, e.bindings.Tap)
 		}
@@ -57,12 +53,12 @@ func (e *Engine) Step(input Input) []Action {
 		return actions
 	case MoveX:
 		if e.active {
-			e.x += int(input.Value)
+			e.x = accumulate(e.x, input.Value)
 			return e.horizontal()
 		}
 	case MoveY:
 		if e.active {
-			e.y += int(input.Value)
+			e.y = accumulate(e.y, input.Value)
 			return e.vertical()
 		}
 	case Scroll:
@@ -72,13 +68,20 @@ func (e *Engine) Step(input Input) []Action {
 		switch {
 		case input.Value > 0 && e.bindings.ScrollUp.Value != "":
 			e.used = true
-			return []Action{e.bindings.ScrollUp}
+			return []config.Action{e.bindings.ScrollUp}
 		case input.Value < 0 && e.bindings.ScrollDown.Value != "":
 			e.used = true
-			return []Action{e.bindings.ScrollDown}
+			return []config.Action{e.bindings.ScrollDown}
 		}
 	}
 	return nil
+}
+
+func accumulate(current int, delta int32) int {
+	if current != 0 && delta != 0 && (current < 0) != (delta < 0) {
+		current = 0
+	}
+	return current + int(delta)
 }
 
 func (e *Engine) thresholdForStep() int {
@@ -88,7 +91,7 @@ func (e *Engine) thresholdForStep() int {
 	return e.retriggerDistance + e.step*e.escalation
 }
 
-func (e *Engine) horizontal() []Action {
+func (e *Engine) horizontal() []config.Action {
 	threshold := e.thresholdForStep()
 	switch {
 	case e.x >= threshold && e.bindings.Right.Value != "":
@@ -99,7 +102,7 @@ func (e *Engine) horizontal() []Action {
 	return nil
 }
 
-func (e *Engine) vertical() []Action {
+func (e *Engine) vertical() []config.Action {
 	threshold := e.thresholdForStep()
 	switch {
 	case e.y >= threshold && e.bindings.Down.Value != "":
@@ -110,9 +113,9 @@ func (e *Engine) vertical() []Action {
 	return nil
 }
 
-func (e *Engine) fire(action Action) []Action {
+func (e *Engine) fire(action config.Action) []config.Action {
 	e.used = true
 	e.step++
 	e.x, e.y = 0, 0
-	return []Action{action}
+	return []config.Action{action}
 }

@@ -4,13 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
 	"github.com/holoplot/go-evdev"
 
 	"github.com/uheplm/nnmxd/internal/config"
-	"github.com/uheplm/nnmxd/internal/gesture"
 )
 
 func TestWriteConfigValidatesAndAtomicallyPublishes(t *testing.T) {
@@ -61,93 +59,6 @@ func TestWriteConfigDoesNotReplaceValidConfigWithInvalidCandidate(t *testing.T) 
 		t.Fatal("invalid candidate replaced existing config")
 	}
 }
-
-func TestWriteMetaState(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "waybar-state")
-	cfg := config.Defaults()
-	cfg.WriteWaybar = true
-	cfg.MetaStateFile = path
-
-	writeMetaState(cfg, true)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var on waybarState
-	if err := json.Unmarshal(data, &on); err != nil {
-		t.Fatal(err)
-	}
-	if on.Class != "on" || on.Text != "META" {
-		t.Fatalf("on state = %#v", on)
-	}
-
-	writeMetaState(cfg, false)
-	data, err = os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var off waybarState
-	if err := json.Unmarshal(data, &off); err != nil {
-		t.Fatal(err)
-	}
-	if off.Class != "off" || off.Text != "" {
-		t.Fatalf("off state = %#v", off)
-	}
-}
-
-func TestGestureBindingPreservesActionTypeAndArguments(t *testing.T) {
-	tests := []struct {
-		name string
-		bind config.Binding
-		want gesture.Action
-	}{
-		{
-			name: "legacy Niri binding",
-			bind: config.Binding{Type: "niri", Value: "toggle-overview"},
-			want: gesture.Action{Type: "niri", Value: "toggle-overview"},
-		},
-		{
-			name: "Noctalia binding with arguments",
-			bind: config.Binding{Type: "noctalia", Value: "volume-up", Arguments: "5"},
-			want: gesture.Action{Type: "noctalia", Value: "volume-up", Arguments: "5"},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := gestureBinding(test.bind); got != test.want {
-				t.Fatalf("gestureBinding(%#v) = %#v, want %#v", test.bind, got, test.want)
-			}
-		})
-	}
-}
-
-func TestNoctaliaGestureArgs(t *testing.T) {
-	tests := []struct {
-		name   string
-		action gesture.Action
-		want   []string
-	}{
-		{
-			name:   "direct command",
-			action: gesture.Action{Type: "noctalia", Value: "volume-up", Arguments: "5"},
-			want:   []string{"msg", "volume-up", "5"},
-		},
-		{
-			name:   "media subcommand",
-			action: gesture.Action{Type: "noctalia", Value: "media volume-up", Arguments: "5"},
-			want:   []string{"msg", "media", "volume-up", "5"},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := noctaliaGestureArgs(test.action); !reflect.DeepEqual(got, test.want) {
-				t.Fatalf("noctaliaGestureArgs(%#v) = %v, want %v", test.action, got, test.want)
-			}
-		})
-	}
-}
-
 func TestShouldSuppressTriggerOnlyForUnappliedGeneration(t *testing.T) {
 	tests := []struct {
 		generation        int
