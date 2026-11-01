@@ -42,6 +42,23 @@ type reporter struct {
 	appliedGeneration int
 }
 
+type thumbwheelRemainderKey struct {
+	code     evdev.EvCode
+	presetID string
+	held     bool
+}
+
+type dpiRequest struct {
+	presetID        string
+	value           int
+	captureBaseline bool
+}
+
+type dpiResult struct {
+	request dpiRequest
+	err     error
+}
+
 func (r *reporter) update() {
 	r.data.AppliedGeneration = r.appliedGeneration
 	r.data.UpdatedUnix = time.Now().Unix()
@@ -142,27 +159,6 @@ func runDevice(
 	if !ok {
 		return fmt.Errorf("unknown trigger button %q", initial.Device.TriggerButton)
 	}
-	appliedDPI := 0
-	applyDPI := func(dpi int) error {
-		if dpi == 0 {
-			log.Printf("DPI setting is 0; leaving hardware DPI unchanged")
-			appliedDPI = 0
-			return nil
-		}
-		log.Printf("attempting to set mouse DPI to %d (last confirmed value: %d)", dpi, appliedDPI)
-		if err := hidpp.SetDPI(dev.Path(), dpi); err != nil {
-			log.Printf("set mouse DPI to %d failed: %v", dpi, err)
-			return err
-		}
-		appliedDPI = dpi
-		log.Printf("set mouse DPI to %d", dpi)
-		return nil
-	}
-	if err := applyDPI(initial.Device.DPI); err != nil {
-		status.data.LastError = err.Error()
-		log.Printf("set mouse DPI: %v", err)
-		status.update()
-	}
 	if err := dev.Grab(); err != nil {
 		return fmt.Errorf("grab device: %w", err)
 	}
@@ -192,16 +188,81 @@ func runDevice(
 	go readEvents(ctx, dev, events, readErrors)
 
 	currentConfig := initial
+	dpiRequests := make(chan dpiRequest, 1)
+	dpiResults := make(chan dpiResult)
+	go runDPIWorker(ctx, dev.Path(), dpiRequests, dpiResults)
 	var engine *gesture.Engine
 	gestureActive := false
+	thumbButtonHeld := false
+	var heldPreset config.Preset
+	focusedAppID := status.data.AppID
+	focusUpdates := make(chan string, 1)
+	go pollFocusedAppID(ctx, niriClient, focusUpdates)
+	lastDPIRequest := dpiRequest{}
+	queueProfileDPI := func(appID string) {
+		preset := currentConfig.PresetForApp(appID)
+		request := dpiRequest{
+			presetID: preset.ID, value: effectiveDPI(preset, currentConfig.Device),
+			captureBaseline: needsBaselineDPI(currentConfig),
+		}
+		if request == lastDPIRequest {
+			return
+		}
+		lastDPIRequest = request
+		select {
+		case dpiRequests <- request:
+		default:
+			select {
+			case <-dpiRequests:
+			default:
+			}
+			select {
+			case dpiRequests <- request:
+			default:
+			}
+		}
+	}
+	queueProfileDPI(focusedAppID)
 	pressedMeta := map[evdev.EvCode]bool{}
+	consumedSideButtons := map[evdev.EvCode]bool{}
+	consumedThumbClicks := map[evdev.EvCode]bool{}
 	wheelRemainders := map[evdev.EvCode]float64{}
+	thumbwheelRemainders := map[thumbwheelRemainderKey]int64{}
+	relativeCodes := dev.CapableEvents(evdev.EV_REL)
+	hasHighResolutionHorizontalWheel := false
+	for _, code := range relativeCodes {
+		if code == evdev.REL_HWHEEL_HI_RES {
+			hasHighResolutionHorizontalWheel = true
+			break
+		}
+	}
 	suppressTriggerRelease := false
 	for {
 		select {
 		case <-ctx.Done():
 			releaseMetaKeys(keyboard, pressedMeta)
 			return nil
+		case appID := <-focusUpdates:
+			if appID != focusedAppID {
+				focusedAppID = appID
+				preset := currentConfig.PresetForApp(appID)
+				status.data.AppID = appID
+				status.data.PresetID = preset.ID
+				status.data.PresetName = preset.Name
+				status.data.Mode = string(preset.Mode)
+				queueProfileDPI(appID)
+				status.update()
+			}
+		case result := <-dpiResults:
+			if result.request == lastDPIRequest {
+				if result.err != nil {
+					status.data.LastError = result.err.Error()
+				} else if strings.Contains(status.data.LastError, "DPI") ||
+					strings.Contains(status.data.LastError, "dpi") {
+					status.data.LastError = ""
+				}
+				status.update()
+			}
 		case err := <-readErrors:
 			releaseMetaKeys(keyboard, pressedMeta)
 			return err
@@ -212,9 +273,9 @@ func runDevice(
 			if event.Type == evdev.EV_KEY && event.Code == triggerCode {
 				switch event.Value {
 				case 1:
+					thumbButtonHeld = true
 					suppressTriggerRelease = false
 					previousGeneration := status.appliedGeneration
-					previousDPI := currentConfig.Device.DPI
 					loaded, loadErr := config.Load(configPath)
 					if loadErr != nil {
 						status.data.LastError = loadErr.Error()
@@ -226,12 +287,10 @@ func runDevice(
 					suppressTriggerRelease = loadErr == nil &&
 						shouldSuppressTrigger(loaded.ApplyGeneration, status.appliedGeneration)
 					log.Printf(
-						"thumb-button press: config generation %d (applied %d), DPI request %d (previous config request %d, last confirmed %d)",
+						"thumb-button press: config generation %d (applied %d), device DPI request %d",
 						currentConfig.ApplyGeneration,
 						previousGeneration,
 						currentConfig.Device.DPI,
-						previousDPI,
-						appliedDPI,
 					)
 					if suppressTriggerRelease {
 						log.Printf(
@@ -245,20 +304,7 @@ func runDevice(
 							status.appliedGeneration = loaded.ApplyGeneration
 						}
 					}
-					if currentConfig.Device.DPI != appliedDPI {
-						apply := func() error { return applyDPI(currentConfig.Device.DPI) }
-						var applyErr error
-						if suppressTriggerRelease {
-							applyErr = retryDPIApply(apply, 3, 250*time.Millisecond)
-						} else {
-							applyErr = apply()
-						}
-						if applyErr != nil {
-							status.data.LastError = applyErr.Error()
-						} else {
-							status.data.LastError = ""
-						}
-					}
+					queueProfileDPI(focusedAppID)
 					if currentConfig.Device.TriggerButton != initial.Device.TriggerButton ||
 						currentConfig.Device.Path != initial.Device.Path ||
 						currentConfig.Device.AutoDetect != initial.Device.AutoDetect {
@@ -270,9 +316,13 @@ func runDevice(
 						cancel()
 						if appErr != nil {
 							status.data.LastError = appErr.Error()
-							appID = ""
+							appID = focusedAppID
+						} else {
+							focusedAppID = appID
 						}
 						preset := currentConfig.PresetForApp(appID)
+						queueProfileDPI(appID)
+						heldPreset = preset
 						status.data.AppID = appID
 						status.data.PresetID = preset.ID
 						status.data.PresetName = preset.Name
@@ -296,6 +346,7 @@ func runDevice(
 					status.data.MetaOn = len(pressedMeta) > 0
 					status.update()
 				case 0:
+					thumbButtonHeld = false
 					if suppressTriggerRelease {
 						log.Printf("thumb-button release consumed after config apply; assigned action was skipped")
 						suppressTriggerRelease = false
@@ -310,6 +361,84 @@ func runDevice(
 				continue
 			}
 
+			if handleThumbClickEvent(
+				heldPreset,
+				event,
+				thumbButtonHeld && !suppressTriggerRelease && gestureActive,
+				consumedThumbClicks,
+				func(action config.Action) {
+					if engine != nil {
+						engine.MarkUsed()
+					}
+					dispatchActions(niriClient, []config.Action{action})
+				},
+			) {
+				continue
+			}
+
+			if handleSideButtonEvent(
+				currentConfig.PresetForApp(focusedAppID),
+				event,
+				consumedSideButtons,
+				func(action config.Action) {
+					dispatchActions(niriClient, []config.Action{action})
+				},
+			) {
+				continue
+			}
+
+			if event.Type == evdev.EV_REL {
+				if hasHighResolutionHorizontalWheel && isLegacyHighResolutionWheel(event.Code) {
+					continue
+				}
+				if direction, isHorizontalWheel := horizontalWheelDirection(event.Code, event.Value); isHorizontalWheel {
+					buttonPressed := thumbButtonHeld && !suppressTriggerRelease
+					if buttonPressed && gestureActive && engine != nil {
+						engine.MarkUsed()
+					}
+					if !thumbButtonHeld || !suppressTriggerRelease {
+						var preset config.Preset
+						if buttonPressed {
+							preset = heldPreset
+						} else {
+							preset = currentConfig.PresetForApp(focusedAppID)
+						}
+						action := thumbwheelAction(preset, direction, buttonPressed)
+						if action.Value != "" {
+							remainderKey := thumbwheelRemainderKey{
+								code: event.Code, presetID: preset.ID, held: buttonPressed,
+							}
+							count, actionDirection := thumbwheelActionCount(
+								event.Code, event.Value, thumbwheelRemainders, remainderKey)
+							if count > 0 {
+								var actions []config.Action
+								for i := 0; i < count; i++ {
+									if buttonPressed && gestureActive && engine != nil {
+										actions = append(actions, engine.Step(gesture.Input{Kind: actionDirection})...)
+									} else {
+										actions = append(actions, action)
+									}
+								}
+								dispatchActions(niriClient, actions)
+							}
+							continue
+						}
+					}
+					preset := currentConfig.PresetForApp(focusedAppID)
+					if buttonPressed {
+						preset = heldPreset
+					}
+					if percent, ok := wheelScale(event.Code, effectiveScrollSettings(preset, currentConfig.Device)); ok {
+						scaled := *event
+						scaled.Value = scaleWheelValue(event.Code, event.Value, percent, wheelRemainders)
+						if scaled.Value != 0 {
+							forward(clone, &scaled)
+						}
+					}
+					continue
+				}
+			}
+
 			if gestureActive && engine != nil && event.Type == evdev.EV_REL {
 				switch event.Code {
 				case evdev.REL_X:
@@ -322,7 +451,11 @@ func runDevice(
 				continue
 			}
 			if event.Type == evdev.EV_REL {
-				if percent, ok := wheelScale(event.Code, currentConfig.Device); ok {
+				preset := currentConfig.PresetForApp(focusedAppID)
+				if thumbButtonHeld && !suppressTriggerRelease {
+					preset = heldPreset
+				}
+				if percent, ok := wheelScale(event.Code, effectiveScrollSettings(preset, currentConfig.Device)); ok {
 					scaled := *event
 					scaled.Value = scaleWheelValue(event.Code, event.Value, percent, wheelRemainders)
 					if scaled.Value != 0 {
@@ -427,6 +560,130 @@ func wheelScale(code evdev.EvCode, settings config.Device) (int, bool) {
 	}
 }
 
+func effectiveDPI(preset config.Preset, device config.Device) int {
+	if preset.DPI != 0 {
+		return preset.DPI
+	}
+	return device.DPI
+}
+
+func needsBaselineDPI(cfg config.Config) bool {
+	if cfg.Device.DPI != 0 {
+		return false
+	}
+	for _, preset := range cfg.Presets {
+		if preset.DPI != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func effectiveScrollSettings(preset config.Preset, device config.Device) config.Device {
+	if preset.VerticalScroll != 0 {
+		device.VerticalScroll = preset.VerticalScroll
+	}
+	if preset.HorizontalScroll != 0 {
+		device.HorizontalScroll = preset.HorizontalScroll
+	}
+	return device
+}
+
+func runDPIWorker(
+	ctx context.Context,
+	inputPath string,
+	requests <-chan dpiRequest,
+	results chan<- dpiResult,
+) {
+	baselineDPI := 0
+	baselineKnown := false
+	currentDPI := baselineDPI
+
+	for {
+		var request dpiRequest
+		select {
+		case <-ctx.Done():
+			return
+		case request = <-requests:
+		}
+
+		for attempt := 0; ; attempt++ {
+			var err error
+			if request.captureBaseline && !baselineKnown {
+				baselineDPI, err = hidpp.CurrentDPI(inputPath)
+				if err != nil {
+					err = fmt.Errorf("read baseline mouse DPI for profile switching: %w", err)
+					log.Printf("%v", err)
+				} else {
+					baselineKnown = true
+					currentDPI = baselineDPI
+					log.Printf("captured baseline mouse DPI %d for profile switching", baselineDPI)
+				}
+			}
+			targetDPI := request.value
+			if targetDPI == 0 && baselineKnown {
+				targetDPI = baselineDPI
+			}
+			switch {
+			case err != nil:
+			case targetDPI == currentDPI:
+			case targetDPI == 0:
+			default:
+				log.Printf("setting DPI for profile %q to %d (requested profile DPI: %d)", request.presetID, targetDPI, request.value)
+				err = hidpp.SetDPI(inputPath, targetDPI)
+				if err == nil {
+					currentDPI = targetDPI
+					log.Printf("set mouse DPI to %d for profile %q", targetDPI, request.presetID)
+				} else {
+					log.Printf("set DPI for profile %q to %d failed: %v", request.presetID, targetDPI, err)
+				}
+			}
+			select {
+			case results <- dpiResult{request: request, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err == nil {
+				break
+			}
+			if !retryableDPIError(err) {
+				break
+			}
+
+			backoff := dpiRetryDelay(attempt)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case request = <-requests:
+				timer.Stop()
+				attempt = -1
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func dpiRetryDelay(attempt int) time.Duration {
+	switch {
+	case attempt < 1:
+		return time.Second
+	case attempt < 3:
+		return 5 * time.Second
+	case attempt < 6:
+		return 15 * time.Second
+	default:
+		return time.Minute
+	}
+}
+
+func retryableDPIError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return !strings.Contains(message, "not supported") &&
+		!strings.Contains(message, "outside the supported range")
+}
+
 func scaleWheelValue(code evdev.EvCode, value int32, percent int, remainders map[evdev.EvCode]float64) int32 {
 	if percent == 100 {
 		remainders[code] = 0
@@ -443,8 +700,195 @@ func newEngine(preset config.Preset) *gesture.Engine {
 		Left: preset.Bindings.Left, Right: preset.Bindings.Right,
 		Up: preset.Bindings.Up, Down: preset.Bindings.Down,
 		Tap: preset.Bindings.Tap, ScrollUp: preset.Bindings.ScrollUp,
-		ScrollDown: preset.Bindings.ScrollDown,
+		ScrollDown:      preset.Bindings.ScrollDown,
+		ThumbwheelLeft:  preset.Bindings.ThumbwheelButtonLeft,
+		ThumbwheelRight: preset.Bindings.ThumbwheelButtonRight,
 	})
+}
+
+func horizontalWheelDirection(code evdev.EvCode, value int32) (gesture.InputKind, bool) {
+	if code != evdev.REL_HWHEEL && code != evdev.REL_HWHEEL_HI_RES || value == 0 {
+		return 0, false
+	}
+	if value < 0 {
+		return gesture.ThumbwheelLeft, true
+	}
+	return gesture.ThumbwheelRight, true
+}
+
+func isLegacyHighResolutionWheel(code evdev.EvCode) bool {
+	return code == evdev.REL_HWHEEL
+}
+
+func thumbwheelAction(preset config.Preset, direction gesture.InputKind, buttonPressed bool) config.Action {
+	if buttonPressed {
+		switch direction {
+		case gesture.ThumbwheelLeft:
+			return preset.Bindings.ThumbwheelButtonLeft
+		case gesture.ThumbwheelRight:
+			return preset.Bindings.ThumbwheelButtonRight
+		}
+		return config.Action{}
+	}
+	switch direction {
+	case gesture.ThumbwheelLeft:
+		return preset.Bindings.ThumbwheelLeft
+	case gesture.ThumbwheelRight:
+		return preset.Bindings.ThumbwheelRight
+	default:
+		return config.Action{}
+	}
+}
+
+func sideButtonAction(preset config.Preset, code evdev.EvCode) (config.Action, bool) {
+	switch code {
+	case evdev.BTN_SIDE:
+		return preset.Bindings.SideBack, true
+	case evdev.BTN_EXTRA:
+		return preset.Bindings.SideForward, true
+	default:
+		return config.Action{}, false
+	}
+}
+
+func thumbClickAction(preset config.Preset, code evdev.EvCode) (config.Action, bool) {
+	switch code {
+	case evdev.BTN_LEFT:
+		return preset.Bindings.ThumbLeftClick, true
+	case evdev.BTN_MIDDLE:
+		return preset.Bindings.ThumbMiddleClick, true
+	case evdev.BTN_RIGHT:
+		return preset.Bindings.ThumbRightClick, true
+	default:
+		return config.Action{}, false
+	}
+}
+
+func handleThumbClickEvent(
+	preset config.Preset,
+	event *evdev.InputEvent,
+	thumbGestureActive bool,
+	consumed map[evdev.EvCode]bool,
+	dispatch func(config.Action),
+) bool {
+	if event.Type != evdev.EV_KEY {
+		return false
+	}
+	if consumed[event.Code] {
+		if event.Value == 0 {
+			delete(consumed, event.Code)
+		}
+		return true
+	}
+	if event.Value != 1 || !thumbGestureActive {
+		return false
+	}
+	action, supported := thumbClickAction(preset, event.Code)
+	if !supported || strings.TrimSpace(action.Value) == "" {
+		return false
+	}
+	consumed[event.Code] = true
+	dispatch(action)
+	return true
+}
+
+func handleSideButtonEvent(
+	preset config.Preset,
+	event *evdev.InputEvent,
+	consumed map[evdev.EvCode]bool,
+	dispatch func(config.Action),
+) bool {
+	if event.Type != evdev.EV_KEY {
+		return false
+	}
+	if consumed[event.Code] {
+		if event.Value == 0 {
+			delete(consumed, event.Code)
+		}
+		return true
+	}
+	if event.Value != 1 {
+		return false
+	}
+	action, supported := sideButtonAction(preset, event.Code)
+	if !supported || strings.TrimSpace(action.Value) == "" {
+		return false
+	}
+	consumed[event.Code] = true
+	dispatch(action)
+	return true
+}
+
+func thumbwheelActionCount(
+	code evdev.EvCode,
+	value int32,
+	remainders map[thumbwheelRemainderKey]int64,
+	remainderKey thumbwheelRemainderKey,
+) (int, gesture.InputKind) {
+	direction, ok := horizontalWheelDirection(code, value)
+	if !ok {
+		return 0, 0
+	}
+	if code == evdev.REL_HWHEEL_HI_RES {
+		total := remainders[remainderKey] + int64(value)
+		count := total / 120
+		remainders[remainderKey] = total - count*120
+		if count < 0 {
+			direction = gesture.ThumbwheelLeft
+			count = -count
+		}
+		if count > 32 {
+			count = 32
+		}
+		return int(count), direction
+	}
+	count := int64(value)
+	if count < 0 {
+		count = -count
+	}
+	if count > 32 {
+		count = 32
+	}
+	return int(count), direction
+}
+
+func pollFocusedAppID(ctx context.Context, client *niri.Client, updates chan string) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var lastLoggedError string
+	var lastErrorLog time.Time
+	for {
+		focusCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		appID, err := client.FocusedAppID(focusCtx)
+		cancel()
+		if err == nil {
+			select {
+			case updates <- appID:
+			default:
+				select {
+				case <-updates:
+				default:
+				}
+				select {
+				case updates <- appID:
+				default:
+				}
+			}
+			lastLoggedError = ""
+		} else if err.Error() != "Niri reports no focused window" {
+			if err.Error() != lastLoggedError || time.Since(lastErrorLog) >= 5*time.Second {
+				log.Printf("refresh focused app for thumbwheel: %v", err)
+				lastLoggedError = err.Error()
+				lastErrorLog = time.Now()
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func supportedMetaKeys() []evdev.EvCode {

@@ -112,3 +112,38 @@ func TestMovementOutsideHoldDoesNothing(t *testing.T) {
 		t.Fatalf("actions outside hold = %v", got)
 	}
 }
+
+func TestThumbwheelActionsRequireActiveHold(t *testing.T) {
+	left := config.Action{Type: config.ActionNiri, Value: "left"}
+	right := config.Action{Type: config.ActionNiri, Value: "right"}
+	tap := config.Action{Type: config.ActionNiri, Value: "toggle-overview"}
+	engine := New(100, 100, 0, Bindings{Tap: tap, ThumbwheelLeft: left, ThumbwheelRight: right})
+	if got := engine.Step(Input{Kind: ThumbwheelLeft}); len(got) != 0 {
+		t.Fatalf("thumbwheel action outside hold = %v", got)
+	}
+	engine.Step(Input{Kind: ButtonPress})
+	for _, test := range []struct {
+		input Input
+		want  config.Action
+	}{
+		{input: Input{Kind: ThumbwheelLeft}, want: left},
+		{input: Input{Kind: ThumbwheelRight}, want: right},
+	} {
+		if got := engine.Step(test.input); !reflect.DeepEqual(got, []config.Action{test.want}) {
+			t.Errorf("thumbwheel action = %v, want %v", got, test.want)
+		}
+	}
+	if got := engine.Step(Input{Kind: ButtonRelease}); len(got) != 0 {
+		t.Fatalf("thumbwheel actions incorrectly emitted tap: %v", got)
+	}
+}
+
+func TestMarkUsedSuppressesTapForPassedThroughThumbwheel(t *testing.T) {
+	tap := config.Action{Type: config.ActionNiri, Value: "toggle-overview"}
+	engine := New(100, 100, 0, Bindings{Tap: tap})
+	engine.Step(Input{Kind: ButtonPress})
+	engine.MarkUsed()
+	if got := engine.Step(Input{Kind: ButtonRelease}); len(got) != 0 {
+		t.Fatalf("passed-through thumbwheel incorrectly emitted tap: %v", got)
+	}
+}

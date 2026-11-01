@@ -61,16 +61,9 @@ func SetDPI(inputPath string, dpi int) error {
 		if _, err := c.request(featureIndex, 0x30, 0x00, byte(dpi>>8), byte(dpi)); err != nil {
 			return fmt.Errorf("set DPI on device slot %d: %w", deviceNumber, err)
 		}
-		current, err := c.request(featureIndex, 0x20)
+		actual, err := c.currentDPI(featureIndex)
 		if err != nil {
 			return fmt.Errorf("read back DPI from device slot %d: %w", deviceNumber, err)
-		}
-		if len(current) < 5 {
-			return fmt.Errorf("read back DPI from device slot %d: response was incomplete", deviceNumber)
-		}
-		actual := int(current[1])<<8 | int(current[2])
-		if actual == 0 {
-			actual = int(current[3])<<8 | int(current[4])
 		}
 		if actual != dpi {
 			return fmt.Errorf("device slot %d reports DPI %d after requesting %d", deviceNumber, actual, dpi)
@@ -80,9 +73,62 @@ func SetDPI(inputPath string, dpi int) error {
 	return dpiDiscoveryError(lastDiscoveryError)
 }
 
+func CurrentDPI(inputPath string) (int, error) {
+	hidraw, err := findHIDPPNode(inputPath)
+	if err != nil {
+		return 0, err
+	}
+	fd, err := syscall.Open(hidraw, syscall.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, fmt.Errorf("open Logitech HID++ interface %s: %w", hidraw, err)
+	}
+	defer syscall.Close(fd)
+
+	var lastDiscoveryError error
+	for deviceNumber := byte(1); deviceNumber <= 6; deviceNumber++ {
+		c := &client{fd: fd, device: deviceNumber, swID: 0x08}
+		featureIndex, _, err := c.findFeature(adjustableDPI)
+		if err != nil {
+			lastDiscoveryError = err
+			continue
+		}
+		if featureIndex == 0 {
+			continue
+		}
+		value, err := c.currentDPI(featureIndex)
+		if err != nil {
+			return 0, fmt.Errorf("read current DPI from device slot %d: %w", deviceNumber, err)
+		}
+		return value, nil
+	}
+	return 0, dpiDiscoveryError(lastDiscoveryError)
+}
+
+func (c *client) currentDPI(featureIndex byte) (int, error) {
+	current, err := c.request(featureIndex, 0x20)
+	if err != nil {
+		return 0, err
+	}
+	return parseCurrentDPI(current)
+}
+
+func parseCurrentDPI(current []byte) (int, error) {
+	if len(current) < 5 {
+		return 0, errors.New("response was incomplete")
+	}
+	actual := int(current[1])<<8 | int(current[2])
+	if actual == 0 {
+		actual = int(current[3])<<8 | int(current[4])
+	}
+	if actual == 0 {
+		return 0, errors.New("device reported zero DPI")
+	}
+	return actual, nil
+}
+
 func dpiDiscoveryError(lastDiscoveryError error) error {
 	if lastDiscoveryError != nil {
-		return fmt.Errorf("could not confirm adjustable DPI support; it will be retried on the next thumb-button press: %w", lastDiscoveryError)
+		return fmt.Errorf("could not confirm adjustable DPI support; nnmxd will retry automatically: %w", lastDiscoveryError)
 	}
 	return errors.New("no paired Logitech device on the selected receiver supports adjustable DPI")
 }

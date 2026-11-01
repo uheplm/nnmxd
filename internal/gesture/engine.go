@@ -10,6 +10,8 @@ const (
 	MoveX
 	MoveY
 	Scroll
+	ThumbwheelLeft
+	ThumbwheelRight
 )
 
 type Input struct {
@@ -20,6 +22,8 @@ type Input struct {
 type Bindings struct {
 	Left, Right, Up, Down     config.Action
 	Tap, ScrollUp, ScrollDown config.Action
+	ThumbwheelLeft            config.Action
+	ThumbwheelRight           config.Action
 }
 
 type Engine struct {
@@ -37,6 +41,12 @@ func New(threshold, retriggerDistance, escalation int, bindings Bindings) *Engin
 }
 
 func (e *Engine) Active() bool { return e.active }
+
+func (e *Engine) MarkUsed() {
+	if e.active {
+		e.used = true
+	}
+}
 
 func (e *Engine) Step(input Input) []config.Action {
 	switch input.Kind {
@@ -72,6 +82,16 @@ func (e *Engine) Step(input Input) []config.Action {
 		case input.Value < 0 && e.bindings.ScrollDown.Value != "":
 			e.used = true
 			return []config.Action{e.bindings.ScrollDown}
+		}
+	case ThumbwheelLeft:
+		if e.active && e.bindings.ThumbwheelLeft.Value != "" {
+			e.used = true
+			return []config.Action{e.bindings.ThumbwheelLeft}
+		}
+	case ThumbwheelRight:
+		if e.active && e.bindings.ThumbwheelRight.Value != "" {
+			e.used = true
+			return []config.Action{e.bindings.ThumbwheelRight}
 		}
 	}
 	return nil

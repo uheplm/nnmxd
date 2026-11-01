@@ -9,6 +9,7 @@ import (
 	"github.com/holoplot/go-evdev"
 
 	"github.com/uheplm/nnmxd/internal/config"
+	"github.com/uheplm/nnmxd/internal/gesture"
 )
 
 func TestWriteConfigValidatesAndAtomicallyPublishes(t *testing.T) {
@@ -153,6 +154,45 @@ func TestWheelScaleSelectsAxesAndResolution(t *testing.T) {
 	}
 }
 
+func TestProfileDPIAndScrollSettingsFallBackToDeviceValues(t *testing.T) {
+	deviceSettings := config.Device{DPI: 800, VerticalScroll: 75, HorizontalScroll: 140}
+	preset := config.Preset{}
+	if got := effectiveDPI(preset, deviceSettings); got != 800 {
+		t.Fatalf("fallback DPI = %d, want 800", got)
+	}
+	if got := effectiveScrollSettings(preset, deviceSettings); got != deviceSettings {
+		t.Fatalf("fallback scroll settings = %#v, want %#v", got, deviceSettings)
+	}
+
+	preset.DPI = 1200
+	preset.VerticalScroll = 60
+	preset.HorizontalScroll = 200
+	if got := effectiveDPI(preset, deviceSettings); got != 1200 {
+		t.Fatalf("profile DPI = %d, want 1200", got)
+	}
+	want := deviceSettings
+	want.VerticalScroll = 60
+	want.HorizontalScroll = 200
+	if got := effectiveScrollSettings(preset, deviceSettings); got != want {
+		t.Fatalf("profile scroll settings = %#v, want %#v", got, want)
+	}
+}
+
+func TestNeedsBaselineDPIOnlyWhenProfileOverridesDeviceUnchangedSetting(t *testing.T) {
+	cfg := config.Defaults()
+	if needsBaselineDPI(cfg) {
+		t.Fatal("baseline DPI should not be needed when all settings inherit device defaults")
+	}
+	cfg.Presets[0].DPI = 1200
+	if !needsBaselineDPI(cfg) {
+		t.Fatal("baseline DPI should be captured when a profile overrides an unchanged device DPI")
+	}
+	cfg.Device.DPI = 800
+	if needsBaselineDPI(cfg) {
+		t.Fatal("baseline DPI should not be needed when device DPI provides the fallback")
+	}
+}
+
 func TestScaleWheelValuePreservesFractionalCountsAndSigns(t *testing.T) {
 	remainders := map[evdev.EvCode]float64{}
 	const wheel = evdev.EvCode(0x0b)
@@ -182,5 +222,261 @@ func TestScaleWheelValueAccumulatesSmallEvents(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("scaled values = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestHorizontalWheelDirection(t *testing.T) {
+	tests := []struct {
+		code      evdev.EvCode
+		value     int32
+		want      gesture.InputKind
+		wantValid bool
+	}{
+		{code: evdev.REL_HWHEEL, value: -1, want: gesture.ThumbwheelLeft, wantValid: true},
+		{code: evdev.REL_HWHEEL_HI_RES, value: 120, want: gesture.ThumbwheelRight, wantValid: true},
+		{code: evdev.REL_HWHEEL, value: 0, wantValid: false},
+		{code: evdev.REL_WHEEL, value: 1, wantValid: false},
+	}
+	for _, test := range tests {
+		got, ok := horizontalWheelDirection(test.code, test.value)
+		if got != test.want || ok != test.wantValid {
+			t.Errorf("horizontalWheelDirection(%#x, %d) = (%d, %t), want (%d, %t)",
+				test.code, test.value, got, ok, test.want, test.wantValid)
+		}
+	}
+	if !isLegacyHighResolutionWheel(evdev.REL_HWHEEL) {
+		t.Fatal("REL_HWHEEL was not recognized as the legacy horizontal-wheel event")
+	}
+	if isLegacyHighResolutionWheel(evdev.REL_HWHEEL_HI_RES) {
+		t.Fatal("REL_HWHEEL_HI_RES was incorrectly recognized as a legacy event")
+	}
+}
+
+func TestThumbwheelActionSelectsHeldAndUnheldBindings(t *testing.T) {
+	left := config.Action{Type: config.ActionNiri, Value: "left"}
+	right := config.Action{Type: config.ActionNiri, Value: "right"}
+	heldLeft := config.Action{Type: config.ActionNoctalia, Value: "audio mic mute"}
+	preset := config.Preset{Bindings: config.Bindings{
+		ThumbwheelLeft: left, ThumbwheelRight: right, ThumbwheelButtonLeft: heldLeft,
+	}}
+	tests := []struct {
+		name string
+		dir  gesture.InputKind
+		held bool
+		want config.Action
+	}{
+		{name: "unheld left", dir: gesture.ThumbwheelLeft, want: left},
+		{name: "unheld right", dir: gesture.ThumbwheelRight, want: right},
+		{name: "held left", dir: gesture.ThumbwheelLeft, held: true, want: heldLeft},
+		{name: "unassigned held right", dir: gesture.ThumbwheelRight, held: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := thumbwheelAction(preset, test.dir, test.held); got != test.want {
+				t.Fatalf("thumbwheelAction() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestThumbwheelActionCountAccumulatesHighResolutionDetents(t *testing.T) {
+	remainders := map[thumbwheelRemainderKey]int64{}
+	key := thumbwheelRemainderKey{code: evdev.REL_HWHEEL_HI_RES, presetID: "default"}
+	for index, value := range []int32{40, 40, 40, -120} {
+		count, direction := thumbwheelActionCount(evdev.REL_HWHEEL_HI_RES, value, remainders, key)
+		wantCount := 0
+		if index == 2 || index == 3 {
+			wantCount = 1
+		}
+		wantDirection := gesture.ThumbwheelRight
+		if index == 3 {
+			wantDirection = gesture.ThumbwheelLeft
+		}
+		if count != wantCount || (count > 0 && direction != wantDirection) {
+			t.Errorf("event %d (%d): got (%d, %d), want (%d, %d)",
+				index, value, count, direction, wantCount, wantDirection)
+		}
+	}
+}
+
+func TestThumbwheelRemaindersAreScopedToPresetAndButtonState(t *testing.T) {
+	remainders := map[thumbwheelRemainderKey]int64{}
+	const code evdev.EvCode = evdev.REL_HWHEEL_HI_RES
+	defaultKey := thumbwheelRemainderKey{code: code, presetID: "default"}
+	discordKey := thumbwheelRemainderKey{code: code, presetID: "discord"}
+	heldKey := thumbwheelRemainderKey{code: code, presetID: "discord", held: true}
+
+	if count, _ := thumbwheelActionCount(code, 80, remainders, defaultKey); count != 0 {
+		t.Fatalf("partial default-profile detent count = %d, want 0", count)
+	}
+	if count, _ := thumbwheelActionCount(code, 80, remainders, discordKey); count != 0 {
+		t.Fatalf("partial Discord detent count = %d, want 0", count)
+	}
+	if count, _ := thumbwheelActionCount(code, 40, remainders, heldKey); count != 0 {
+		t.Fatalf("partial held detent count = %d, want 0", count)
+	}
+	if count, _ := thumbwheelActionCount(code, 40, remainders, discordKey); count != 1 {
+		t.Fatalf("Discord accumulated detent count = %d, want 1", count)
+	}
+	if count, _ := thumbwheelActionCount(code, 40, remainders, heldKey); count != 0 {
+		t.Fatalf("held accumulated detent count = %d, want 0", count)
+	}
+}
+
+func TestLegacyThumbwheelEventsCountWheelSteps(t *testing.T) {
+	remainders := map[thumbwheelRemainderKey]int64{}
+	key := thumbwheelRemainderKey{code: evdev.REL_HWHEEL}
+	count, direction := thumbwheelActionCount(evdev.REL_HWHEEL, -2, remainders, key)
+	if count != 2 || direction != gesture.ThumbwheelLeft {
+		t.Fatalf("legacy wheel action = (%d, %d), want (2, %d)", count, direction, gesture.ThumbwheelLeft)
+	}
+}
+
+func TestSideButtonActionMapsPhysicalButtonsToProfileBindings(t *testing.T) {
+	preset := config.Preset{Bindings: config.Bindings{
+		SideBack:    config.Action{Type: config.ActionNiri, Value: "focus-column-left"},
+		SideForward: config.Action{Type: config.ActionNoctalia, Value: "panel-toggle"},
+	}}
+	tests := []struct {
+		name string
+		code evdev.EvCode
+		want config.Action
+	}{
+		{name: "back side button", code: evdev.BTN_SIDE, want: preset.Bindings.SideBack},
+		{name: "front side button", code: evdev.BTN_EXTRA, want: preset.Bindings.SideForward},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := sideButtonAction(preset, test.code)
+			if !ok || got != test.want {
+				t.Fatalf("sideButtonAction() = (%#v, %t), want (%#v, true)", got, ok, test.want)
+			}
+		})
+	}
+	if _, ok := sideButtonAction(preset, evdev.BTN_TASK); ok {
+		t.Fatal("under-wheel button should not have a profile action")
+	}
+}
+
+func TestHandleSideButtonEventDispatchesOnceAndConsumesRelease(t *testing.T) {
+	action := config.Action{Type: config.ActionNiri, Value: "focus-column-left"}
+	preset := config.Preset{Bindings: config.Bindings{SideBack: action}}
+	consumed := map[evdev.EvCode]bool{}
+	dispatched := 0
+	dispatch := func(got config.Action) {
+		if got != action {
+			t.Errorf("dispatched action = %#v, want %#v", got, action)
+		}
+		dispatched++
+	}
+	press := &evdev.InputEvent{Type: evdev.EV_KEY, Code: evdev.BTN_SIDE, Value: 1}
+	repeat := &evdev.InputEvent{Type: evdev.EV_KEY, Code: evdev.BTN_SIDE, Value: 2}
+	release := &evdev.InputEvent{Type: evdev.EV_KEY, Code: evdev.BTN_SIDE, Value: 0}
+	for _, event := range []*evdev.InputEvent{press, repeat, release} {
+		if !handleSideButtonEvent(preset, event, consumed, dispatch) {
+			t.Errorf("event value %d was not consumed", event.Value)
+		}
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatch count = %d, want 1", dispatched)
+	}
+	if consumed[evdev.BTN_SIDE] {
+		t.Fatal("button remained marked consumed after release")
+	}
+}
+
+func TestHandleSideButtonEventPassesUnassignedEventsThrough(t *testing.T) {
+	preset := config.Preset{}
+	consumed := map[evdev.EvCode]bool{}
+	dispatch := func(config.Action) { t.Error("dispatched an unassigned button") }
+	for _, event := range []*evdev.InputEvent{
+		{Type: evdev.EV_KEY, Code: evdev.BTN_SIDE, Value: 1},
+		{Type: evdev.EV_KEY, Code: evdev.BTN_TASK, Value: 1},
+		{Type: evdev.EV_REL, Code: evdev.REL_X, Value: 1},
+	} {
+		if handleSideButtonEvent(preset, event, consumed, dispatch) {
+			t.Errorf("event type %d code %#x was consumed without an assigned action", event.Type, event.Code)
+		}
+	}
+}
+
+func TestThumbClickActionMapsLeftMiddleAndRightButtons(t *testing.T) {
+	left := config.Action{Type: config.ActionNiri, Value: "maximize-column"}
+	middle := config.Action{Type: config.ActionCommand, Value: "notify-send middle"}
+	right := config.Action{Type: config.ActionNoctalia, Value: "panel-toggle"}
+	preset := config.Preset{Bindings: config.Bindings{
+		ThumbLeftClick: left, ThumbMiddleClick: middle, ThumbRightClick: right,
+	}}
+	for _, test := range []struct {
+		code evdev.EvCode
+		want config.Action
+	}{
+		{code: evdev.BTN_LEFT, want: left},
+		{code: evdev.BTN_MIDDLE, want: middle},
+		{code: evdev.BTN_RIGHT, want: right},
+	} {
+		got, ok := thumbClickAction(preset, test.code)
+		if !ok || got != test.want {
+			t.Errorf("thumbClickAction(%#x) = (%#v, %t), want (%#v, true)",
+				test.code, got, ok, test.want)
+		}
+	}
+	if _, ok := thumbClickAction(preset, evdev.BTN_SIDE); ok {
+		t.Fatal("side button should not have a thumb-click binding")
+	}
+}
+
+func TestHandleThumbMiddleClickEventDispatchesOnceAndConsumesRelease(t *testing.T) {
+	action := config.Action{Type: config.ActionNiri, Value: "maximize-column"}
+	preset := config.Preset{Bindings: config.Bindings{ThumbMiddleClick: action}}
+	consumed := map[evdev.EvCode]bool{}
+	dispatched := 0
+	dispatch := func(got config.Action) {
+		if got != action {
+			t.Errorf("dispatched action = %#v, want %#v", got, action)
+		}
+		dispatched++
+	}
+	events := []*evdev.InputEvent{
+		{Type: evdev.EV_KEY, Code: evdev.BTN_MIDDLE, Value: 1},
+		{Type: evdev.EV_KEY, Code: evdev.BTN_MIDDLE, Value: 2},
+		{Type: evdev.EV_KEY, Code: evdev.BTN_MIDDLE, Value: 0},
+	}
+	for _, event := range events {
+		if !handleThumbClickEvent(preset, event, true, consumed, dispatch) {
+			t.Errorf("active chord event value %d was not consumed", event.Value)
+		}
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatch count = %d, want 1", dispatched)
+	}
+	if consumed[evdev.BTN_MIDDLE] {
+		t.Fatal("middle click remained consumed after release")
+	}
+}
+
+func TestHandleThumbClickEventPassesThroughUnassignedAndInactiveClicks(t *testing.T) {
+	consumed := map[evdev.EvCode]bool{}
+	dispatch := func(config.Action) { t.Error("dispatched an unassigned or inactive click") }
+	leftPress := &evdev.InputEvent{Type: evdev.EV_KEY, Code: evdev.BTN_LEFT, Value: 1}
+	for _, test := range []struct {
+		name   string
+		preset config.Preset
+		active bool
+	}{
+		{name: "unassigned active chord", preset: config.Preset{}, active: true},
+		{
+			name: "assigned click without thumb gesture",
+			preset: config.Preset{Bindings: config.Bindings{
+				ThumbLeftClick: config.Action{Type: config.ActionNiri, Value: "maximize-column"},
+			}},
+			active: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if handleThumbClickEvent(test.preset, leftPress, test.active, consumed, dispatch) {
+				t.Fatal("click was consumed without an assigned active chord")
+			}
+		})
 	}
 }

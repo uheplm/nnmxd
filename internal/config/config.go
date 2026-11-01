@@ -67,13 +67,22 @@ func (a *Action) UnmarshalJSON(data []byte) error {
 }
 
 type Bindings struct {
-	Left       Action `json:"left"`
-	Right      Action `json:"right"`
-	Up         Action `json:"up"`
-	Down       Action `json:"down"`
-	Tap        Action `json:"tap"`
-	ScrollUp   Action `json:"scrollUp"`
-	ScrollDown Action `json:"scrollDown"`
+	Left                  Action `json:"left"`
+	Right                 Action `json:"right"`
+	Up                    Action `json:"up"`
+	Down                  Action `json:"down"`
+	Tap                   Action `json:"tap"`
+	ScrollUp              Action `json:"scrollUp"`
+	ScrollDown            Action `json:"scrollDown"`
+	ThumbwheelLeft        Action `json:"thumbwheelLeft"`
+	ThumbwheelRight       Action `json:"thumbwheelRight"`
+	ThumbwheelButtonLeft  Action `json:"thumbwheelButtonLeft"`
+	ThumbwheelButtonRight Action `json:"thumbwheelButtonRight"`
+	SideBack              Action `json:"sideBack"`
+	SideForward           Action `json:"sideForward"`
+	ThumbLeftClick        Action `json:"thumbLeftClick"`
+	ThumbMiddleClick      Action `json:"thumbMiddleClick"`
+	ThumbRightClick       Action `json:"thumbRightClick"`
 }
 
 type Preset struct {
@@ -81,6 +90,9 @@ type Preset struct {
 	Name              string   `json:"name"`
 	Mode              Mode     `json:"mode"`
 	Glyph             string   `json:"glyph,omitempty"`
+	DPI               int      `json:"dpi"`
+	VerticalScroll    int      `json:"verticalScroll"`
+	HorizontalScroll  int      `json:"horizontalScroll"`
 	Threshold         int      `json:"threshold"`
 	RetriggerDistance int      `json:"retriggerDistance"`
 	Escalation        int      `json:"escalation"`
@@ -123,13 +135,18 @@ func Defaults() Config {
 			Escalation:        0,
 			MetaKey:           "KEY_LEFTMETA",
 			Bindings: Bindings{
-				Left:       Action{Type: ActionNiri, Value: "focus-column-left"},
-				Right:      Action{Type: ActionNiri, Value: "focus-column-right"},
-				Up:         Action{Type: ActionNiri, Value: "focus-workspace-up"},
-				Down:       Action{Type: ActionNiri, Value: "focus-workspace-down"},
-				Tap:        Action{Type: ActionNiri, Value: "toggle-overview"},
-				ScrollUp:   Action{Type: ActionNiri, Value: "focus-workspace-up"},
-				ScrollDown: Action{Type: ActionNiri, Value: "focus-workspace-down"},
+				Left:             Action{Type: ActionNiri, Value: "focus-column-left"},
+				Right:            Action{Type: ActionNiri, Value: "focus-column-right"},
+				Up:               Action{Type: ActionNiri, Value: "focus-workspace-up"},
+				Down:             Action{Type: ActionNiri, Value: "focus-workspace-down"},
+				Tap:              Action{Type: ActionNiri, Value: "toggle-overview"},
+				ScrollUp:         Action{Type: ActionNiri, Value: "focus-workspace-up"},
+				ScrollDown:       Action{Type: ActionNiri, Value: "focus-workspace-down"},
+				SideBack:         Action{Type: ActionNiri},
+				SideForward:      Action{Type: ActionNiri},
+				ThumbLeftClick:   Action{Type: ActionNiri},
+				ThumbMiddleClick: Action{Type: ActionNiri},
+				ThumbRightClick:  Action{Type: ActionNiri},
 			},
 		}},
 		AppPresets: map[string]string{},
@@ -225,6 +242,22 @@ func (c Config) Validate() error {
 		if _, exists := presets[preset.ID]; exists {
 			return fmt.Errorf("duplicate preset id %q", preset.ID)
 		}
+		if preset.DPI != 0 && (preset.DPI < 100 || preset.DPI > 16000) {
+			return fmt.Errorf("preset %q dpi must be 0 (device default) or between 100 and 16000", preset.ID)
+		}
+		if preset.VerticalScroll != 0 && (preset.VerticalScroll < 10 || preset.VerticalScroll > 500) {
+			return fmt.Errorf("preset %q verticalScroll must be 0 (device default) or between 10 and 500", preset.ID)
+		}
+		if preset.HorizontalScroll != 0 && (preset.HorizontalScroll < 10 || preset.HorizontalScroll > 500) {
+			return fmt.Errorf("preset %q horizontalScroll must be 0 (device default) or between 10 and 500", preset.ID)
+		}
+		for name, binding := range map[string]Action{
+			"sideBack": preset.Bindings.SideBack, "sideForward": preset.Bindings.SideForward,
+		} {
+			if err := binding.Validate(); err != nil {
+				return fmt.Errorf("preset %q binding %s: %w", preset.ID, name, err)
+			}
+		}
 		switch preset.Mode {
 		case ModeGesture:
 			if preset.Threshold <= 0 {
@@ -240,7 +273,14 @@ func (c Config) Validate() error {
 				"left": preset.Bindings.Left, "right": preset.Bindings.Right,
 				"up": preset.Bindings.Up, "down": preset.Bindings.Down,
 				"tap": preset.Bindings.Tap, "scrollUp": preset.Bindings.ScrollUp,
-				"scrollDown": preset.Bindings.ScrollDown,
+				"scrollDown":            preset.Bindings.ScrollDown,
+				"thumbwheelLeft":        preset.Bindings.ThumbwheelLeft,
+				"thumbwheelRight":       preset.Bindings.ThumbwheelRight,
+				"thumbwheelButtonLeft":  preset.Bindings.ThumbwheelButtonLeft,
+				"thumbwheelButtonRight": preset.Bindings.ThumbwheelButtonRight,
+				"thumbLeftClick":        preset.Bindings.ThumbLeftClick,
+				"thumbMiddleClick":      preset.Bindings.ThumbMiddleClick,
+				"thumbRightClick":       preset.Bindings.ThumbRightClick,
 			} {
 				if err := binding.Validate(); err != nil {
 					return fmt.Errorf("preset %q binding %s: %w", preset.ID, name, err)

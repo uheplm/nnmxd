@@ -49,7 +49,7 @@ func TestDPIProbeFailureDoesNotClaimUnsupportedDevice(t *testing.T) {
 	if strings.Contains(err.Error(), "no paired Logitech device") {
 		t.Fatalf("discovery error incorrectly claims unsupported DPI: %v", err)
 	}
-	if !strings.Contains(err.Error(), "retried on the next thumb-button press") {
+	if !strings.Contains(err.Error(), "retry automatically") {
 		t.Fatalf("discovery error lacks retry guidance: %v", err)
 	}
 }
@@ -58,5 +58,30 @@ func TestDPIUnsupportedErrorRequiresResponsiveDevice(t *testing.T) {
 	err := dpiDiscoveryError(nil)
 	if err == nil || err.Error() != "no paired Logitech device on the selected receiver supports adjustable DPI" {
 		t.Fatalf("discovery error = %v, want a confirmed unsupported error", err)
+	}
+}
+
+func TestParseCurrentDPI(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want int
+	}{
+		{name: "current", data: []byte{0, 0x03, 0x20, 0x03, 0x20}, want: 800},
+		{name: "fallback value", data: []byte{0, 0, 0, 0x04, 0xb0}, want: 1200},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCurrentDPI(test.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("current DPI = %d, want %d", got, test.want)
+			}
+		})
+	}
+	if _, err := parseCurrentDPI([]byte{0}); err == nil {
+		t.Fatal("incomplete DPI response was accepted")
 	}
 }
