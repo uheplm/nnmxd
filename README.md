@@ -133,6 +133,10 @@ The following is a complete example. Empty action `value` strings mean “unassi
       "threshold": 100,
       "retriggerDistance": 100,
       "escalation": 0,
+      "separateAxisSettings": false,
+      "xAxis": {"threshold": 100, "retriggerDistance": 100, "escalation": 0},
+      "yAxis": {"threshold": 100, "retriggerDistance": 100, "escalation": 0},
+      "windowSizeScaling": "disabled",
       "metaKey": "KEY_LEFTMETA",
       "bindings": {
         "left": {"type": "niri", "value": "focus-column-left"},
@@ -193,10 +197,13 @@ The following is a complete example. Empty action `value` strings mean “unassi
 | `threshold` | Positive evdev relative-motion count threshold for the first directional gesture. |
 | `retriggerDistance` | Positive evdev motion count needed for each later action. Defaults to `threshold` when absent in an older configuration. |
 | `escalation` | Non-negative count added to the retrigger distance after each directional action. `0` keeps later distances constant. |
+| `separateAxisSettings` | When `true`, use `xAxis` distances for left/right and `yAxis` distances for up/down. When absent or `false`, both axes use the legacy shared distance fields. |
+| `xAxis`, `yAxis` | Each has positive `threshold`, positive `retriggerDistance`, and non-negative `escalation` values. |
+| `windowSizeScaling` | `disabled`, `threshold`, `retrigger`, or `all`. Scales selected X-axis distances by focused-window logical width divided by focused-output logical width, and Y-axis distances by focused-window logical height divided by focused-output logical height. `retrigger` also scales escalation. Defaults to `disabled` in older configurations. |
 | `metaKey` | Modifier injected in `meta-toggle` mode: `KEY_LEFTMETA`, `KEY_RIGHTMETA`, `KEY_LEFTCTRL`, `KEY_RIGHTCTRL`, `KEY_LEFTALT`, `KEY_RIGHTALT`, `KEY_LEFTSHIFT`, or `KEY_RIGHTSHIFT`. |
 | `bindings` | Action definitions described below. |
 
-`threshold`, `retriggerDistance`, `escalation`, and gesture bindings are used in Gesture mode. Side-button bindings work in either mode.
+Gesture distance fields and gesture bindings are used in Gesture mode. Side-button bindings work in either mode. The shared fields remain required for backwards compatibility; with `separateAxisSettings` enabled, `xAxis` and `yAxis` define the directional distances.
 
 ### Bindings and actions
 
@@ -224,7 +231,7 @@ Niri and Noctalia argument strings are split with simple shell-like quoting and 
 
 1. The daemon opens the selected evdev device and grabs it so input events are routed through the daemon while it is active.
 2. A uinput virtual pointer clone forwards ordinary pointer events. Wheel events are scaled according to the active profile and device settings.
-3. While the thumb trigger is held in Gesture mode, relative X/Y movement is accumulated. Reversing direction clears the accumulation for that axis. Reaching the first threshold dispatches one directional action and resets movement; each later action requires `retriggerDistance + (actions already fired × escalation)` additional counts.
+3. On thumb press, the service reads the focused window and output geometry from Niri. If window-size scaling is enabled, it multiplies selected X-axis distances by `window width / output width` and Y-axis distances by `window height / output height`; retrigger scaling also applies to escalation. While the thumb trigger is held, it polls focused-window geometry every 100 ms and updates the active gesture's distances as focus moves between windows. Existing movement accumulation is retained, so the new window's multiplier applies to the remaining distance in the current stroke; if the updated threshold is already met, the directional action fires immediately. If geometry is unavailable, the configured distances are used and the issue is reported in service status. While the thumb trigger is held in Gesture mode, relative X/Y movement is accumulated. Reversing direction clears the accumulation for that axis. Reaching the first threshold dispatches one directional action and resets movement; each later action requires that axis's `retriggerDistance + (actions already fired × escalation)` additional counts.
 4. A tap action runs on release only if no gesture, scroll action, thumbwheel action, or configured thumb chord used the hold. Assigned chords run once on click-down and consume their matching release and repeats; unassigned clicks pass through as regular mouse clicks.
 5. In Meta-toggle mode, each thumb press toggles the selected virtual modifier and forwards the physical button event. Held virtual modifier keys are released when the service exits.
 6. Side-button actions are checked against the focused app's profile on each press. An assigned action consumes the press and release; unassigned buttons are forwarded.
@@ -253,8 +260,14 @@ The service writes status to `$XDG_RUNTIME_DIR/mxmouse/status.json`; `XDG_RUNTIM
 | `lastError` | Most recent config, device, input, or DPI error. |
 | `appliedGeneration` | Highest configuration generation acknowledged by a thumb press. |
 | `updatedUnix` | Status update time as Unix seconds. |
+| `gesture.active` | Whether the thumb gesture is currently active. |
+| `gesture.xProgress`, `gesture.yProgress` | Movement toward the next threshold on each axis, clamped to `0`–`1`. |
+| `gesture.xDirection`, `gesture.yDirection` | Current direction on each axis, or empty when there is no movement. |
+| `gesture.triggerCount` | Monotonic count of gesture actions triggered since the service started. |
+| `gesture.triggeredAxis`, `gesture.triggeredDirection` | Axis and direction of the latest gesture trigger or retrigger. |
+| `gesture.triggeredUnixMilli` | Latest gesture trigger time as Unix milliseconds. |
 
-The status file is written atomically with user-only permissions. The plugin reads it for Overview status and the `modifier` bar widget. Detailed logs are available through `journalctl --user -u nnmxd.service`.
+The status file is written atomically with user-only permissions. The plugin reads it for Overview status and the `modifier` and `gesture-map` bar widgets. Detailed logs are available through `journalctl --user -u nnmxd.service`.
 
 Common checks:
 

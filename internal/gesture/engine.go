@@ -1,6 +1,10 @@
 package gesture
 
-import "github.com/uheplm/nnmxd/internal/config"
+import (
+	"math"
+
+	"github.com/uheplm/nnmxd/internal/config"
+)
 
 type InputKind uint8
 
@@ -27,20 +31,63 @@ type Bindings struct {
 }
 
 type Engine struct {
-	threshold, retriggerDistance, escalation int
-	bindings                                 Bindings
-	active, used                             bool
-	step, x, y                               int
+	xAxis, yAxis             config.GestureDistances
+	bindings                 Bindings
+	separateAxisSettings     bool
+	active, used             bool
+	step, xStep, yStep, x, y int
+	triggerCount             uint64
+	triggeredAxis            string
+	triggeredDirection       string
+}
+
+type Progress struct {
+	X                  float64
+	XDirection         string
+	Y                  float64
+	YDirection         string
+	TriggerCount       uint64
+	TriggeredAxis      string
+	TriggeredDirection string
 }
 
 func New(threshold, retriggerDistance, escalation int, bindings Bindings) *Engine {
+	distances := config.GestureDistances{
+		Threshold: threshold, RetriggerDistance: retriggerDistance, Escalation: escalation,
+	}
+	return NewWithAxes(distances, distances, false, bindings)
+}
+
+func NewWithAxes(
+	xAxis, yAxis config.GestureDistances,
+	separateAxisSettings bool,
+	bindings Bindings,
+) *Engine {
 	return &Engine{
-		threshold: threshold, retriggerDistance: retriggerDistance, escalation: escalation,
-		bindings: bindings,
+		xAxis: xAxis, yAxis: yAxis,
+		separateAxisSettings: separateAxisSettings, bindings: bindings,
 	}
 }
 
 func (e *Engine) Active() bool { return e.active }
+
+func (e *Engine) Progress() Progress {
+	progress := Progress{
+		TriggerCount:       e.triggerCount,
+		TriggeredAxis:      e.triggeredAxis,
+		TriggeredDirection: e.triggeredDirection,
+	}
+	if !e.active {
+		return progress
+	}
+	progress.X, progress.XDirection = axisProgress(
+		e.x, e.thresholdForStep(e.xAxis, e.xStep), "right", "left",
+	)
+	progress.Y, progress.YDirection = axisProgress(
+		e.y, e.thresholdForStep(e.yAxis, e.yStep), "down", "up",
+	)
+	return progress
+}
 
 func (e *Engine) MarkUsed() {
 	if e.active {
@@ -48,18 +95,38 @@ func (e *Engine) MarkUsed() {
 	}
 }
 
+func (e *Engine) SetDistances(threshold, retriggerDistance, escalation int) []config.Action {
+	distances := config.GestureDistances{
+		Threshold: threshold, RetriggerDistance: retriggerDistance, Escalation: escalation,
+	}
+	return e.SetAxisDistances(distances, distances)
+}
+
+func (e *Engine) SetAxisDistances(xAxis, yAxis config.GestureDistances) []config.Action {
+	e.xAxis, e.yAxis = xAxis, yAxis
+	if !e.active {
+		return nil
+	}
+	if actions := e.horizontal(); len(actions) > 0 {
+		return actions
+	}
+	return e.vertical()
+}
+
 func (e *Engine) Step(input Input) []config.Action {
 	switch input.Kind {
 	case ButtonPress:
 		e.active, e.used = true, false
-		e.step, e.x, e.y = 0, 0, 0
+		e.step, e.xStep, e.yStep, e.x, e.y = 0, 0, 0, 0, 0
+		e.triggerCount = 0
+		e.triggeredAxis, e.triggeredDirection = "", ""
 	case ButtonRelease:
 		var actions []config.Action
 		if !e.used && e.bindings.Tap.Value != "" {
 			actions = append(actions, e.bindings.Tap)
 		}
 		e.active, e.used = false, false
-		e.step, e.x, e.y = 0, 0, 0
+		e.step, e.xStep, e.yStep, e.x, e.y = 0, 0, 0, 0, 0
 		return actions
 	case MoveX:
 		if e.active {
@@ -104,38 +171,61 @@ func accumulate(current int, delta int32) int {
 	return current + int(delta)
 }
 
-func (e *Engine) thresholdForStep() int {
-	if e.step == 0 {
-		return e.threshold
+func (e *Engine) thresholdForStep(distances config.GestureDistances, axisStep int) int {
+	step := e.step
+	if e.separateAxisSettings {
+		step = axisStep
 	}
-	return e.retriggerDistance + e.step*e.escalation
+	if step == 0 {
+		return distances.Threshold
+	}
+	return distances.RetriggerDistance + step*distances.Escalation
 }
 
 func (e *Engine) horizontal() []config.Action {
-	threshold := e.thresholdForStep()
+	threshold := e.thresholdForStep(e.xAxis, e.xStep)
 	switch {
 	case e.x >= threshold && e.bindings.Right.Value != "":
-		return e.fire(e.bindings.Right)
+		return e.fire(e.bindings.Right, "x", "right")
 	case e.x <= -threshold && e.bindings.Left.Value != "":
-		return e.fire(e.bindings.Left)
+		return e.fire(e.bindings.Left, "x", "left")
 	}
 	return nil
 }
 
 func (e *Engine) vertical() []config.Action {
-	threshold := e.thresholdForStep()
+	threshold := e.thresholdForStep(e.yAxis, e.yStep)
 	switch {
 	case e.y >= threshold && e.bindings.Down.Value != "":
-		return e.fire(e.bindings.Down)
+		return e.fire(e.bindings.Down, "y", "down")
 	case e.y <= -threshold && e.bindings.Up.Value != "":
-		return e.fire(e.bindings.Up)
+		return e.fire(e.bindings.Up, "y", "up")
 	}
 	return nil
 }
 
-func (e *Engine) fire(action config.Action) []config.Action {
+func axisProgress(value, threshold int, positiveDirection, negativeDirection string) (float64, string) {
+	if value == 0 || threshold <= 0 {
+		return 0, ""
+	}
+	direction := positiveDirection
+	if value < 0 {
+		direction = negativeDirection
+	}
+	return math.Min(1, math.Abs(float64(value))/float64(threshold)), direction
+}
+
+func (e *Engine) fire(action config.Action, axis, direction string) []config.Action {
 	e.used = true
 	e.step++
+	e.triggerCount++
+	e.triggeredAxis = axis
+	e.triggeredDirection = direction
+	if axis == "x" {
+		e.xStep++
+	} else {
+		e.yStep++
+	}
 	e.x, e.y = 0, 0
 	return []config.Action{action}
 }

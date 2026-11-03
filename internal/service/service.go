@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,16 +25,29 @@ import (
 )
 
 type Status struct {
-	Running           bool   `json:"running"`
-	Device            string `json:"device"`
-	Mode              string `json:"mode"`
-	AppID             string `json:"appId"`
-	PresetID          string `json:"presetId"`
-	PresetName        string `json:"presetName"`
-	MetaOn            bool   `json:"metaOn"`
-	LastError         string `json:"lastError"`
-	AppliedGeneration int    `json:"appliedGeneration"`
-	UpdatedUnix       int64  `json:"updatedUnix"`
+	Running           bool          `json:"running"`
+	Device            string        `json:"device"`
+	Mode              string        `json:"mode"`
+	AppID             string        `json:"appId"`
+	PresetID          string        `json:"presetId"`
+	PresetName        string        `json:"presetName"`
+	MetaOn            bool          `json:"metaOn"`
+	LastError         string        `json:"lastError"`
+	AppliedGeneration int           `json:"appliedGeneration"`
+	UpdatedUnix       int64         `json:"updatedUnix"`
+	Gesture           GestureStatus `json:"gesture"`
+}
+
+type GestureStatus struct {
+	Active             bool    `json:"active"`
+	XProgress          float64 `json:"xProgress"`
+	XDirection         string  `json:"xDirection"`
+	YProgress          float64 `json:"yProgress"`
+	YDirection         string  `json:"yDirection"`
+	TriggerCount       uint64  `json:"triggerCount"`
+	TriggeredAxis      string  `json:"triggeredAxis"`
+	TriggeredDirection string  `json:"triggeredDirection"`
+	TriggeredUnixMilli int64   `json:"triggeredUnixMilli"`
 }
 
 type reporter struct {
@@ -57,6 +71,11 @@ type dpiRequest struct {
 type dpiResult struct {
 	request dpiRequest
 	err     error
+}
+
+type windowGeometryUpdate struct {
+	geometry niri.WindowGeometry
+	err      error
 }
 
 func (r *reporter) update() {
@@ -193,11 +212,62 @@ func runDevice(
 	go runDPIWorker(ctx, dev.Path(), dpiRequests, dpiResults)
 	var engine *gesture.Engine
 	gestureActive := false
+	lastGestureWrite := time.Time{}
+	lastEngineTriggerCount := uint64(0)
+	gestureDirty := false
+	publishGesture := func(force bool) {
+		next := status.data.Gesture
+		next.Active = gestureActive && engine != nil
+		if next.Active {
+			progress := engine.Progress()
+			next.XProgress = progress.X
+			next.XDirection = progress.XDirection
+			next.YProgress = progress.Y
+			next.YDirection = progress.YDirection
+			if progress.TriggerCount > lastEngineTriggerCount {
+				next.TriggerCount += progress.TriggerCount - lastEngineTriggerCount
+				next.TriggeredAxis = progress.TriggeredAxis
+				next.TriggeredDirection = progress.TriggeredDirection
+				next.TriggeredUnixMilli = time.Now().UnixMilli()
+				force = true
+			}
+			lastEngineTriggerCount = progress.TriggerCount
+		} else {
+			next.XProgress = 0
+			next.XDirection = ""
+			next.YProgress = 0
+			next.YDirection = ""
+		}
+		if next != status.data.Gesture {
+			status.data.Gesture = next
+			gestureDirty = true
+		}
+		if !gestureDirty || (!force && time.Since(lastGestureWrite) < 50*time.Millisecond) {
+			return
+		}
+		status.update()
+		lastGestureWrite = time.Now()
+		gestureDirty = false
+	}
+	defer func() {
+		gestureActive = false
+		publishGesture(true)
+	}()
 	thumbButtonHeld := false
 	var heldPreset config.Preset
 	focusedAppID := status.data.AppID
 	focusUpdates := make(chan string, 1)
 	go pollFocusedAppID(ctx, niriClient, focusUpdates)
+	var geometryUpdates <-chan windowGeometryUpdate
+	var cancelGeometryPoll context.CancelFunc
+	stopGeometryPoll := func() {
+		if cancelGeometryPoll != nil {
+			cancelGeometryPoll()
+			cancelGeometryPoll = nil
+		}
+		geometryUpdates = nil
+	}
+	defer stopGeometryPoll()
 	lastDPIRequest := dpiRequest{}
 	queueProfileDPI := func(appID string) {
 		preset := currentConfig.PresetForApp(appID)
@@ -253,6 +323,24 @@ func runDevice(
 				queueProfileDPI(appID)
 				status.update()
 			}
+		case update := <-geometryUpdates:
+			if !gestureActive || engine == nil ||
+				heldPreset.WindowSizeScaling == config.WindowSizeScalingDisabled {
+				continue
+			}
+			geometry := update.geometry
+			if update.err != nil {
+				geometry = niri.WindowGeometry{}
+				status.data.LastError = fmt.Sprintf(
+					"window-size scaling unavailable; using configured distances: %v",
+					update.err,
+				)
+			} else if strings.HasPrefix(status.data.LastError, "window-size scaling unavailable;") {
+				status.data.LastError = ""
+			}
+			xAxis, yAxis := scaledGestureDistances(heldPreset, geometry)
+			dispatchActions(niriClient, engine.SetAxisDistances(xAxis, yAxis))
+			publishGesture(false)
 		case result := <-dpiResults:
 			if result.request == lastDPIRequest {
 				if result.err != nil {
@@ -273,6 +361,7 @@ func runDevice(
 			if event.Type == evdev.EV_KEY && event.Code == triggerCode {
 				switch event.Value {
 				case 1:
+					stopGeometryPoll()
 					thumbButtonHeld = true
 					suppressTriggerRelease = false
 					previousGeneration := status.appliedGeneration
@@ -312,15 +401,33 @@ func runDevice(
 					}
 					if !suppressTriggerRelease {
 						focusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-						appID, appErr := niriClient.FocusedAppID(focusCtx)
+						geometry, geometryErr := niriClient.FocusedWindowGeometry(focusCtx)
+						appID := geometry.AppID
+						var appErr error
+						if geometryErr != nil {
+							appID, appErr = niriClient.FocusedAppID(focusCtx)
+						}
 						cancel()
 						if appErr != nil {
 							status.data.LastError = appErr.Error()
+							appID = focusedAppID
+						} else if appID == "" {
+							status.data.LastError = "Niri returned an empty focused app_id"
 							appID = focusedAppID
 						} else {
 							focusedAppID = appID
 						}
 						preset := currentConfig.PresetForApp(appID)
+						if preset.Mode == config.ModeGesture &&
+							preset.WindowSizeScaling != config.WindowSizeScalingDisabled &&
+							geometryErr != nil && appErr == nil {
+							status.data.LastError = fmt.Sprintf(
+								"window-size scaling unavailable; using configured distances: %v",
+								geometryErr,
+							)
+						} else if strings.HasPrefix(status.data.LastError, "window-size scaling unavailable;") {
+							status.data.LastError = ""
+						}
 						queueProfileDPI(appID)
 						heldPreset = preset
 						status.data.AppID = appID
@@ -339,14 +446,25 @@ func runDevice(
 							forward(clone, event)
 						} else {
 							gestureActive = true
-							engine = newEngine(preset)
+							xAxis, yAxis := scaledGestureDistances(preset, geometry)
+							engine = newEngine(preset, xAxis, yAxis)
+							lastEngineTriggerCount = 0
 							_ = engine.Step(gesture.Input{Kind: gesture.ButtonPress})
+							if preset.WindowSizeScaling != config.WindowSizeScalingDisabled {
+								pollCtx, cancel := context.WithCancel(ctx)
+								cancelGeometryPoll = cancel
+								updates := make(chan windowGeometryUpdate, 1)
+								geometryUpdates = updates
+								go pollFocusedWindowGeometry(pollCtx, niriClient, updates)
+							}
 						}
 					}
+					publishGesture(true)
 					status.data.MetaOn = len(pressedMeta) > 0
 					status.update()
 				case 0:
 					thumbButtonHeld = false
+					stopGeometryPoll()
 					if suppressTriggerRelease {
 						log.Printf("thumb-button release consumed after config apply; assigned action was skipped")
 						suppressTriggerRelease = false
@@ -356,6 +474,7 @@ func runDevice(
 					} else {
 						forward(clone, event)
 					}
+					publishGesture(true)
 					status.update()
 				}
 				continue
@@ -442,9 +561,13 @@ func runDevice(
 			if gestureActive && engine != nil && event.Type == evdev.EV_REL {
 				switch event.Code {
 				case evdev.REL_X:
-					dispatchActions(niriClient, engine.Step(gesture.Input{Kind: gesture.MoveX, Value: event.Value}))
+					actions := engine.Step(gesture.Input{Kind: gesture.MoveX, Value: event.Value})
+					publishGesture(false)
+					dispatchActions(niriClient, actions)
 				case evdev.REL_Y:
-					dispatchActions(niriClient, engine.Step(gesture.Input{Kind: gesture.MoveY, Value: event.Value}))
+					actions := engine.Step(gesture.Input{Kind: gesture.MoveY, Value: event.Value})
+					publishGesture(false)
+					dispatchActions(niriClient, actions)
 				case evdev.REL_WHEEL:
 					dispatchActions(niriClient, engine.Step(gesture.Input{Kind: gesture.Scroll, Value: event.Value}))
 				}
@@ -695,8 +818,58 @@ func scaleWheelValue(code evdev.EvCode, value int32, percent int, remainders map
 	return result
 }
 
-func newEngine(preset config.Preset) *gesture.Engine {
-	return gesture.New(preset.Threshold, preset.RetriggerDistance, preset.Escalation, gesture.Bindings{
+func scaledGestureDistances(
+	preset config.Preset,
+	geometry niri.WindowGeometry,
+) (config.GestureDistances, config.GestureDistances) {
+	xAxis := config.GestureDistances{
+		Threshold: preset.Threshold, RetriggerDistance: preset.RetriggerDistance, Escalation: preset.Escalation,
+	}
+	yAxis := xAxis
+	if preset.SeparateAxisSettings {
+		xAxis = preset.XAxis
+		yAxis = preset.YAxis
+	}
+	scaleThreshold := preset.WindowSizeScaling == config.WindowSizeScalingThreshold ||
+		preset.WindowSizeScaling == config.WindowSizeScalingAll
+	scaleRetrigger := preset.WindowSizeScaling == config.WindowSizeScalingRetrigger ||
+		preset.WindowSizeScaling == config.WindowSizeScalingAll
+	if geometry.WindowWidth > 0 && geometry.OutputWidth > 0 {
+		xAxis = scaleGestureDistances(xAxis, geometry.WindowWidth/geometry.OutputWidth, scaleThreshold, scaleRetrigger)
+	}
+	if geometry.WindowHeight > 0 && geometry.OutputHeight > 0 {
+		yAxis = scaleGestureDistances(yAxis, geometry.WindowHeight/geometry.OutputHeight, scaleThreshold, scaleRetrigger)
+	}
+	return xAxis, yAxis
+}
+
+func scaleGestureDistances(
+	distances config.GestureDistances,
+	factor float64,
+	scaleThreshold, scaleRetrigger bool,
+) config.GestureDistances {
+	if scaleThreshold {
+		distances.Threshold = scaleGestureDistance(distances.Threshold, factor)
+	}
+	if scaleRetrigger {
+		distances.RetriggerDistance = scaleGestureDistance(distances.RetriggerDistance, factor)
+		distances.Escalation = scaleGestureDistance(distances.Escalation, factor)
+	}
+	return distances
+}
+
+func scaleGestureDistance(distance int, factor float64) int {
+	if distance == 0 {
+		return 0
+	}
+	return max(1, int(math.Round(float64(distance)*factor)))
+}
+
+func newEngine(
+	preset config.Preset,
+	xAxis, yAxis config.GestureDistances,
+) *gesture.Engine {
+	return gesture.NewWithAxes(xAxis, yAxis, preset.SeparateAxisSettings, gesture.Bindings{
 		Left: preset.Bindings.Left, Right: preset.Bindings.Right,
 		Up: preset.Bindings.Up, Down: preset.Bindings.Down,
 		Tap: preset.Bindings.Tap, ScrollUp: preset.Bindings.ScrollUp,
@@ -880,6 +1053,41 @@ func pollFocusedAppID(ctx context.Context, client *niri.Client, updates chan str
 				log.Printf("refresh focused app for thumbwheel: %v", err)
 				lastLoggedError = err.Error()
 				lastErrorLog = time.Now()
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func pollFocusedWindowGeometry(
+	ctx context.Context,
+	client *niri.Client,
+	updates chan windowGeometryUpdate,
+) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		focusCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		geometry, err := client.FocusedWindowGeometry(focusCtx)
+		cancel()
+
+		update := windowGeometryUpdate{geometry: geometry, err: err}
+		select {
+		case updates <- update:
+		default:
+			select {
+			case <-updates:
+			default:
+			}
+			select {
+			case updates <- update:
+			case <-ctx.Done():
+				return
 			}
 		}
 

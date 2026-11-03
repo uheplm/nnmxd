@@ -19,6 +19,28 @@ type Window struct {
 	IsFocused bool   `json:"is_focused"`
 }
 
+type WindowGeometry struct {
+	AppID        string
+	WindowWidth  float64
+	WindowHeight float64
+	OutputWidth  float64
+	OutputHeight float64
+}
+
+type focusedWindowInfo struct {
+	AppID  string `json:"app_id"`
+	Layout struct {
+		WindowSize []float64 `json:"window_size"`
+	} `json:"layout"`
+}
+
+type focusedOutputInfo struct {
+	Logical *struct {
+		Width  float64 `json:"width"`
+		Height float64 `json:"height"`
+	} `json:"logical"`
+}
+
 type Client struct {
 	socket string
 }
@@ -52,6 +74,52 @@ func (c *Client) FocusedAppID(ctx context.Context) (string, error) {
 		}
 	}
 	return "", errors.New("Niri reports no focused window")
+}
+
+func (c *Client) FocusedWindowGeometry(ctx context.Context) (WindowGeometry, error) {
+	windowJSON, err := c.command(ctx, "--json", "focused-window")
+	if err != nil {
+		return WindowGeometry{}, err
+	}
+	outputJSON, err := c.command(ctx, "--json", "focused-output")
+	if err != nil {
+		return WindowGeometry{}, err
+	}
+	geometry, err := parseFocusedWindowGeometry(windowJSON, outputJSON)
+	if err != nil {
+		return WindowGeometry{}, err
+	}
+	return geometry, nil
+}
+
+func parseFocusedWindowGeometry(windowJSON, outputJSON []byte) (WindowGeometry, error) {
+	var window focusedWindowInfo
+	if err := json.Unmarshal(windowJSON, &window); err != nil {
+		return WindowGeometry{}, fmt.Errorf("decode Niri focused window: %w", err)
+	}
+	if window.AppID == "" {
+		return WindowGeometry{}, errors.New("Niri focused window has no app_id")
+	}
+	if len(window.Layout.WindowSize) < 2 ||
+		window.Layout.WindowSize[0] <= 0 ||
+		window.Layout.WindowSize[1] <= 0 {
+		return WindowGeometry{}, errors.New("Niri focused window has no positive dimensions")
+	}
+
+	var output focusedOutputInfo
+	if err := json.Unmarshal(outputJSON, &output); err != nil {
+		return WindowGeometry{}, fmt.Errorf("decode Niri focused output: %w", err)
+	}
+	if output.Logical == nil || output.Logical.Width <= 0 || output.Logical.Height <= 0 {
+		return WindowGeometry{}, errors.New("Niri focused output has no positive logical dimensions")
+	}
+	return WindowGeometry{
+		AppID:        window.AppID,
+		WindowWidth:  window.Layout.WindowSize[0],
+		WindowHeight: window.Layout.WindowSize[1],
+		OutputWidth:  output.Logical.Width,
+		OutputHeight: output.Logical.Height,
+	}, nil
 }
 
 func (c *Client) Action(name string) {

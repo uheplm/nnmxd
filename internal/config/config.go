@@ -19,6 +19,15 @@ const (
 	ModeMetaToggle Mode = "meta-toggle"
 )
 
+type WindowSizeScaling string
+
+const (
+	WindowSizeScalingDisabled  WindowSizeScaling = "disabled"
+	WindowSizeScalingThreshold WindowSizeScaling = "threshold"
+	WindowSizeScalingRetrigger WindowSizeScaling = "retrigger"
+	WindowSizeScalingAll       WindowSizeScaling = "all"
+)
+
 type Device struct {
 	AutoDetect       bool   `json:"autoDetect"`
 	Path             string `json:"path"`
@@ -85,19 +94,29 @@ type Bindings struct {
 	ThumbRightClick       Action `json:"thumbRightClick"`
 }
 
+type GestureDistances struct {
+	Threshold         int `json:"threshold"`
+	RetriggerDistance int `json:"retriggerDistance"`
+	Escalation        int `json:"escalation"`
+}
+
 type Preset struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name"`
-	Mode              Mode     `json:"mode"`
-	Glyph             string   `json:"glyph,omitempty"`
-	DPI               int      `json:"dpi"`
-	VerticalScroll    int      `json:"verticalScroll"`
-	HorizontalScroll  int      `json:"horizontalScroll"`
-	Threshold         int      `json:"threshold"`
-	RetriggerDistance int      `json:"retriggerDistance"`
-	Escalation        int      `json:"escalation"`
-	MetaKey           string   `json:"metaKey"`
-	Bindings          Bindings `json:"bindings"`
+	ID                   string            `json:"id"`
+	Name                 string            `json:"name"`
+	Mode                 Mode              `json:"mode"`
+	Glyph                string            `json:"glyph,omitempty"`
+	DPI                  int               `json:"dpi"`
+	VerticalScroll       int               `json:"verticalScroll"`
+	HorizontalScroll     int               `json:"horizontalScroll"`
+	Threshold            int               `json:"threshold"`
+	RetriggerDistance    int               `json:"retriggerDistance"`
+	Escalation           int               `json:"escalation"`
+	SeparateAxisSettings bool              `json:"separateAxisSettings"`
+	XAxis                GestureDistances  `json:"xAxis"`
+	YAxis                GestureDistances  `json:"yAxis"`
+	WindowSizeScaling    WindowSizeScaling `json:"windowSizeScaling"`
+	MetaKey              string            `json:"metaKey"`
+	Bindings             Bindings          `json:"bindings"`
 }
 
 type Config struct {
@@ -133,6 +152,9 @@ func Defaults() Config {
 			Threshold:         100,
 			RetriggerDistance: 100,
 			Escalation:        0,
+			XAxis:             GestureDistances{Threshold: 100, RetriggerDistance: 100},
+			YAxis:             GestureDistances{Threshold: 100, RetriggerDistance: 100},
+			WindowSizeScaling: WindowSizeScalingDisabled,
 			MetaKey:           "KEY_LEFTMETA",
 			Bindings: Bindings{
 				Left:             Action{Type: ActionNiri, Value: "focus-column-left"},
@@ -200,12 +222,46 @@ func Load(path string) (Config, error) {
 			if _, exists := rawConfig.Presets[i]["retriggerDistance"]; !exists {
 				cfg.Presets[i].RetriggerDistance = cfg.Presets[i].Threshold
 			}
+			migrateAxisDistances(&cfg.Presets[i], rawConfig.Presets[i], "xAxis")
+			migrateAxisDistances(&cfg.Presets[i], rawConfig.Presets[i], "yAxis")
+		}
+		if cfg.Presets[i].WindowSizeScaling == "" {
+			cfg.Presets[i].WindowSizeScaling = WindowSizeScalingDisabled
 		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func migrateAxisDistances(preset *Preset, raw map[string]json.RawMessage, field string) {
+	axis := &preset.XAxis
+	if field == "yAxis" {
+		axis = &preset.YAxis
+	}
+	rawAxis, exists := raw[field]
+	if !exists {
+		*axis = GestureDistances{
+			Threshold:         preset.Threshold,
+			RetriggerDistance: preset.RetriggerDistance,
+			Escalation:        preset.Escalation,
+		}
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rawAxis, &fields); err != nil {
+		return
+	}
+	if _, exists := fields["threshold"]; !exists {
+		axis.Threshold = preset.Threshold
+	}
+	if _, exists := fields["retriggerDistance"]; !exists {
+		axis.RetriggerDistance = preset.RetriggerDistance
+	}
+	if _, exists := fields["escalation"]; !exists {
+		axis.Escalation = preset.Escalation
+	}
 }
 
 func (c Config) Validate() error {
@@ -242,6 +298,12 @@ func (c Config) Validate() error {
 		if _, exists := presets[preset.ID]; exists {
 			return fmt.Errorf("duplicate preset id %q", preset.ID)
 		}
+		switch preset.WindowSizeScaling {
+		case "", WindowSizeScalingDisabled, WindowSizeScalingThreshold,
+			WindowSizeScalingRetrigger, WindowSizeScalingAll:
+		default:
+			return fmt.Errorf("preset %q has unsupported windowSizeScaling %q", preset.ID, preset.WindowSizeScaling)
+		}
 		if preset.DPI != 0 && (preset.DPI < 100 || preset.DPI > 16000) {
 			return fmt.Errorf("preset %q dpi must be 0 (device default) or between 100 and 16000", preset.ID)
 		}
@@ -268,6 +330,21 @@ func (c Config) Validate() error {
 			}
 			if preset.Escalation < 0 {
 				return fmt.Errorf("preset %q escalation cannot be negative", preset.ID)
+			}
+			if preset.SeparateAxisSettings {
+				for name, distances := range map[string]GestureDistances{
+					"xAxis": preset.XAxis, "yAxis": preset.YAxis,
+				} {
+					if distances.Threshold <= 0 {
+						return fmt.Errorf("preset %q %s threshold must be greater than zero", preset.ID, name)
+					}
+					if distances.RetriggerDistance <= 0 {
+						return fmt.Errorf("preset %q %s retriggerDistance must be greater than zero", preset.ID, name)
+					}
+					if distances.Escalation < 0 {
+						return fmt.Errorf("preset %q %s escalation cannot be negative", preset.ID, name)
+					}
+				}
 			}
 			for name, binding := range map[string]Action{
 				"left": preset.Bindings.Left, "right": preset.Bindings.Right,

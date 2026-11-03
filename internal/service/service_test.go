@@ -10,7 +10,30 @@ import (
 
 	"github.com/uheplm/nnmxd/internal/config"
 	"github.com/uheplm/nnmxd/internal/gesture"
+	"github.com/uheplm/nnmxd/internal/niri"
 )
+
+func TestGestureStatusIsPublished(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	want := GestureStatus{
+		Active: true, XProgress: 0.4, XDirection: "left", YProgress: 0.2, YDirection: "down",
+		TriggerCount: 3, TriggeredAxis: "x", TriggeredDirection: "left", TriggeredUnixMilli: 1234,
+	}
+	report := reporter{path: path, data: Status{Gesture: want}}
+	report.update()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Status
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Gesture != want {
+		t.Fatalf("published gesture status = %+v, want %+v", got.Gesture, want)
+	}
+}
 
 func TestWriteConfigValidatesAndAtomicallyPublishes(t *testing.T) {
 	dir := t.TempDir()
@@ -19,6 +42,7 @@ func TestWriteConfigValidatesAndAtomicallyPublishes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(candidatePath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +56,95 @@ func TestWriteConfigValidatesAndAtomicallyPublishes(t *testing.T) {
 	}
 	if loaded.DefaultPresetID != "default" {
 		t.Fatalf("default preset = %q", loaded.DefaultPresetID)
+	}
+}
+
+func TestScaledGestureDistances(t *testing.T) {
+	preset := config.Preset{
+		Threshold:         101,
+		RetriggerDistance: 81,
+		Escalation:        21,
+	}
+	geometry := niri.WindowGeometry{
+		WindowWidth: 960, WindowHeight: 540,
+		OutputWidth: 1920, OutputHeight: 1080,
+	}
+	tests := []struct {
+		name string
+		mode config.WindowSizeScaling
+		want config.GestureDistances
+	}{
+		{
+			name: "disabled",
+			mode: config.WindowSizeScalingDisabled,
+			want: config.GestureDistances{Threshold: 101, RetriggerDistance: 81, Escalation: 21},
+		},
+		{
+			name: "initial threshold",
+			mode: config.WindowSizeScalingThreshold,
+			want: config.GestureDistances{Threshold: 51, RetriggerDistance: 81, Escalation: 21},
+		},
+		{
+			name: "retrigger and escalation",
+			mode: config.WindowSizeScalingRetrigger,
+			want: config.GestureDistances{Threshold: 101, RetriggerDistance: 41, Escalation: 11},
+		},
+		{
+			name: "all",
+			mode: config.WindowSizeScalingAll,
+			want: config.GestureDistances{Threshold: 51, RetriggerDistance: 41, Escalation: 11},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			preset.WindowSizeScaling = test.mode
+			xAxis, yAxis := scaledGestureDistances(preset, geometry)
+			if xAxis != test.want || yAxis != test.want {
+				t.Fatalf("scaled distances = (%#v, %#v), want (%#v, %#v)",
+					xAxis, yAxis, test.want, test.want)
+			}
+		})
+	}
+}
+
+func TestScaledGestureDistancesUsesIndependentAxesAndGeometry(t *testing.T) {
+	preset := config.Preset{
+		WindowSizeScaling:    config.WindowSizeScalingAll,
+		SeparateAxisSettings: true,
+		XAxis: config.GestureDistances{
+			Threshold: 100, RetriggerDistance: 80, Escalation: 20,
+		},
+		YAxis: config.GestureDistances{
+			Threshold: 60, RetriggerDistance: 40, Escalation: 10,
+		},
+	}
+	geometry := niri.WindowGeometry{
+		WindowWidth: 960, WindowHeight: 810,
+		OutputWidth: 1920, OutputHeight: 1080,
+	}
+	xAxis, yAxis := scaledGestureDistances(preset, geometry)
+	if xAxis != (config.GestureDistances{Threshold: 50, RetriggerDistance: 40, Escalation: 10}) {
+		t.Fatalf("X distances = %#v", xAxis)
+	}
+	if yAxis != (config.GestureDistances{Threshold: 45, RetriggerDistance: 30, Escalation: 8}) {
+		t.Fatalf("Y distances = %#v", yAxis)
+	}
+}
+
+func TestScaledGestureDistancesFallbackForInvalidGeometry(t *testing.T) {
+	preset := config.Preset{
+		Threshold:         100,
+		RetriggerDistance: 120,
+		Escalation:        20,
+		WindowSizeScaling: config.WindowSizeScalingAll,
+	}
+	xAxis, yAxis := scaledGestureDistances(
+		preset,
+		niri.WindowGeometry{WindowWidth: 0, WindowHeight: 0, OutputWidth: 1920, OutputHeight: 1080},
+	)
+	want := config.GestureDistances{Threshold: 100, RetriggerDistance: 120, Escalation: 20}
+	if xAxis != want || yAxis != want {
+		t.Fatalf("invalid geometry distances = (%#v, %#v), want (%#v, %#v)", xAxis, yAxis, want, want)
 	}
 }
 

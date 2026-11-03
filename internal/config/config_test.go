@@ -17,6 +17,13 @@ func TestDefaultsValidateAndSelectAppPreset(t *testing.T) {
 		t.Fatalf("default gesture distances = (%d, %d, %d), want (100, 100, 0)",
 			cfg.Presets[0].Threshold, cfg.Presets[0].RetriggerDistance, cfg.Presets[0].Escalation)
 	}
+	if cfg.Presets[0].WindowSizeScaling != WindowSizeScalingDisabled {
+		t.Fatalf("default window-size scaling = %q, want disabled", cfg.Presets[0].WindowSizeScaling)
+	}
+	if cfg.Presets[0].XAxis != (GestureDistances{Threshold: 100, RetriggerDistance: 100}) ||
+		cfg.Presets[0].YAxis != cfg.Presets[0].XAxis {
+		t.Fatalf("default axis distances = (%#v, %#v)", cfg.Presets[0].XAxis, cfg.Presets[0].YAxis)
+	}
 	if got := cfg.PresetForApp("org.example.App").ID; got != "default" {
 		t.Fatalf("fallback preset = %q, want default", got)
 	}
@@ -27,6 +34,51 @@ func TestDefaultsValidateAndSelectAppPreset(t *testing.T) {
 	cfg.AppPresets["org.example.App"] = "meta"
 	if got := cfg.PresetForApp("org.example.App").ID; got != "meta" {
 		t.Fatalf("assigned preset = %q, want meta", got)
+	}
+}
+
+func TestLoadLegacyPresetDefaultsWindowSizeScalingToDisabled(t *testing.T) {
+	cfg := Defaults()
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	var presets []map[string]json.RawMessage
+	if err := json.Unmarshal(document["presets"], &presets); err != nil {
+		t.Fatal(err)
+	}
+	delete(presets[0], "windowSizeScaling")
+	document["presets"], err = json.Marshal(presets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Presets[0].WindowSizeScaling != WindowSizeScalingDisabled {
+		t.Fatalf("legacy window-size scaling = %q, want disabled", loaded.Presets[0].WindowSizeScaling)
+	}
+}
+
+func TestValidationRejectsUnknownWindowSizeScaling(t *testing.T) {
+	cfg := Defaults()
+	cfg.Presets[0].WindowSizeScaling = "window"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate succeeded with unsupported window-size scaling")
 	}
 }
 
@@ -254,6 +306,9 @@ func TestLoadLegacyPresetDefaultsRetriggerDistanceToThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 	delete(presets[0], "retriggerDistance")
+	delete(presets[0], "separateAxisSettings")
+	delete(presets[0], "xAxis")
+	delete(presets[0], "yAxis")
 	document["presets"], err = json.Marshal(presets)
 	if err != nil {
 		t.Fatal(err)
@@ -272,6 +327,22 @@ func TestLoadLegacyPresetDefaultsRetriggerDistanceToThreshold(t *testing.T) {
 	}
 	if loaded.Presets[0].RetriggerDistance != 175 {
 		t.Fatalf("legacy retrigger distance = %d, want threshold 175", loaded.Presets[0].RetriggerDistance)
+	}
+	wantAxis := GestureDistances{Threshold: 175, RetriggerDistance: 175}
+	if loaded.Presets[0].SeparateAxisSettings ||
+		loaded.Presets[0].XAxis != wantAxis ||
+		loaded.Presets[0].YAxis != wantAxis {
+		t.Fatalf("legacy axis settings = (%t, %#v, %#v)", loaded.Presets[0].SeparateAxisSettings,
+			loaded.Presets[0].XAxis, loaded.Presets[0].YAxis)
+	}
+}
+
+func TestValidationChecksSeparateAxisDistances(t *testing.T) {
+	cfg := Defaults()
+	cfg.Presets[0].SeparateAxisSettings = true
+	cfg.Presets[0].XAxis.Threshold = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate succeeded with a zero X threshold")
 	}
 }
 

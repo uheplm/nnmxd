@@ -47,6 +47,96 @@ func TestRetriggerDistanceAndScroll(t *testing.T) {
 	}
 }
 
+func TestProgressTracksThresholdAndTriggerDirection(t *testing.T) {
+	right := config.Action{Type: config.ActionNiri, Value: "right"}
+	engine := New(100, 50, 0, Bindings{Right: right})
+	engine.Step(Input{Kind: ButtonPress})
+
+	engine.Step(Input{Kind: MoveX, Value: 25})
+	if got := engine.Progress(); got.X != 0.25 || got.XDirection != "right" {
+		t.Fatalf("initial X progress = %+v, want 0.25 right", got)
+	}
+
+	engine.Step(Input{Kind: MoveX, Value: 75})
+	if got := engine.Progress(); got.X != 0 || got.TriggerCount != 1 ||
+		got.TriggeredAxis != "x" || got.TriggeredDirection != "right" {
+		t.Fatalf("progress after trigger = %+v, want reset progress and right trigger", got)
+	}
+
+	engine.Step(Input{Kind: MoveX, Value: -25})
+	if got := engine.Progress(); got.X != 0.5 || got.XDirection != "left" {
+		t.Fatalf("reversed X progress = %+v, want 0.5 left", got)
+	}
+
+	up := config.Action{Type: config.ActionNiri, Value: "up"}
+	verticalEngine := New(100, 50, 0, Bindings{Up: up})
+	verticalEngine.Step(Input{Kind: ButtonPress})
+	verticalEngine.Step(Input{Kind: MoveY, Value: -25})
+	if got := verticalEngine.Progress(); got.Y != 0.25 || got.YDirection != "up" {
+		t.Fatalf("initial Y progress = %+v, want 0.25 up", got)
+	}
+}
+
+func TestDistanceChangesApplyDuringActiveGesture(t *testing.T) {
+	right := config.Action{Type: config.ActionNiri, Value: "focus-column-right"}
+	engine := New(100, 100, 0, Bindings{Right: right})
+	engine.Step(Input{Kind: ButtonPress})
+	if got := engine.Step(Input{Kind: MoveX, Value: 20}); len(got) != 0 {
+		t.Fatalf("initial movement actions = %v", got)
+	}
+
+	engine.SetDistances(25, 30, 0)
+	if got := engine.Step(Input{Kind: MoveX, Value: 5}); !reflect.DeepEqual(got, []config.Action{right}) {
+		t.Fatalf("gesture after dynamic distance update = %v, want %v", got, right)
+	}
+	if got := engine.Step(Input{Kind: MoveX, Value: 29}); len(got) != 0 {
+		t.Fatalf("retrigger fired below dynamically updated distance: %v", got)
+	}
+	if got := engine.Step(Input{Kind: MoveX, Value: 1}); !reflect.DeepEqual(got, []config.Action{right}) {
+		t.Fatalf("retrigger after dynamic distance update = %v, want %v", got, right)
+	}
+}
+
+func TestIndependentAxisGestureDistances(t *testing.T) {
+	left := config.Action{Type: config.ActionNiri, Value: "focus-column-left"}
+	down := config.Action{Type: config.ActionNiri, Value: "focus-workspace-down"}
+	engine := NewWithAxes(
+		config.GestureDistances{Threshold: 40, RetriggerDistance: 30, Escalation: 10},
+		config.GestureDistances{Threshold: 100, RetriggerDistance: 70, Escalation: 20},
+		true,
+		Bindings{Left: left, Down: down},
+	)
+	engine.Step(Input{Kind: ButtonPress})
+	if got := engine.Step(Input{Kind: MoveX, Value: -40}); !reflect.DeepEqual(got, []config.Action{left}) {
+		t.Fatalf("X gesture = %v, want %v", got, left)
+	}
+	if got := engine.Step(Input{Kind: MoveY, Value: 99}); len(got) != 0 {
+		t.Fatalf("Y gesture fired below Y threshold = %v", got)
+	}
+	if got := engine.Step(Input{Kind: MoveY, Value: 1}); !reflect.DeepEqual(got, []config.Action{down}) {
+		t.Fatalf("Y gesture = %v, want %v", got, down)
+	}
+	if got := engine.Step(Input{Kind: MoveY, Value: 89}); len(got) != 0 {
+		t.Fatalf("Y retrigger fired below Y distance = %v", got)
+	}
+	if got := engine.Step(Input{Kind: MoveY, Value: 1}); !reflect.DeepEqual(got, []config.Action{down}) {
+		t.Fatalf("Y retrigger = %v, want %v", got, down)
+	}
+}
+
+func TestDistanceChangeCanCompleteAccumulatedMovement(t *testing.T) {
+	right := config.Action{Type: config.ActionNiri, Value: "focus-column-right"}
+	engine := New(100, 100, 0, Bindings{Right: right})
+	engine.Step(Input{Kind: ButtonPress})
+	if got := engine.Step(Input{Kind: MoveX, Value: 50}); len(got) != 0 {
+		t.Fatalf("initial movement actions = %v", got)
+	}
+
+	if got := engine.SetDistances(25, 30, 0); !reflect.DeepEqual(got, []config.Action{right}) {
+		t.Fatalf("actions after threshold update = %v, want %v", got, right)
+	}
+}
+
 func TestRetriggerEscalatesIndependently(t *testing.T) {
 	right := config.Action{Type: config.ActionNiri, Value: "right"}
 	engine := New(100, 100, 50, Bindings{Right: right})
