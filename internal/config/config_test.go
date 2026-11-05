@@ -20,6 +20,10 @@ func TestDefaultsValidateAndSelectAppPreset(t *testing.T) {
 	if cfg.Presets[0].WindowSizeScaling != WindowSizeScalingDisabled {
 		t.Fatalf("default window-size scaling = %q, want disabled", cfg.Presets[0].WindowSizeScaling)
 	}
+	if cfg.Device.HorizontalScrollWindowWidthScale != HorizontalScrollWindowWidthScalingDisabled {
+		t.Fatalf("default horizontal scroll width scaling = %q, want disabled",
+			cfg.Device.HorizontalScrollWindowWidthScale)
+	}
 	if cfg.Presets[0].XAxis != (GestureDistances{Threshold: 100, RetriggerDistance: 100}) ||
 		cfg.Presets[0].YAxis != cfg.Presets[0].XAxis {
 		t.Fatalf("default axis distances = (%#v, %#v)", cfg.Presets[0].XAxis, cfg.Presets[0].YAxis)
@@ -74,6 +78,44 @@ func TestLoadLegacyPresetDefaultsWindowSizeScalingToDisabled(t *testing.T) {
 	}
 }
 
+func TestLoadLegacyDeviceDefaultsHorizontalScrollWidthScalingToDisabled(t *testing.T) {
+	cfg := Defaults()
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	var device map[string]json.RawMessage
+	if err := json.Unmarshal(document["device"], &device); err != nil {
+		t.Fatal(err)
+	}
+	delete(device, "horizontalScrollWindowWidthScaling")
+	document["device"], err = json.Marshal(device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Device.HorizontalScrollWindowWidthScale != HorizontalScrollWindowWidthScalingDisabled {
+		t.Fatalf("legacy horizontal scroll width scaling = %q, want disabled",
+			loaded.Device.HorizontalScrollWindowWidthScale)
+	}
+}
+
 func TestValidationRejectsUnknownWindowSizeScaling(t *testing.T) {
 	cfg := Defaults()
 	cfg.Presets[0].WindowSizeScaling = "window"
@@ -121,6 +163,9 @@ func TestValidationRejectsInvalidDPIAndScrollScales(t *testing.T) {
 		"dpi above supported range":     func(cfg *Config) { cfg.Device.DPI = 16001 },
 		"vertical scroll below range":   func(cfg *Config) { cfg.Device.VerticalScroll = 9 },
 		"horizontal scroll above range": func(cfg *Config) { cfg.Device.HorizontalScroll = 501 },
+		"unknown horizontal scroll width scaling": func(cfg *Config) {
+			cfg.Device.HorizontalScrollWindowWidthScale = "invalid"
+		},
 	}
 	for name, modify := range tests {
 		t.Run(name, func(t *testing.T) {

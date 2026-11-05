@@ -260,6 +260,17 @@ func runDevice(
 	go pollFocusedAppID(ctx, niriClient, focusUpdates)
 	var geometryUpdates <-chan windowGeometryUpdate
 	var cancelGeometryPoll context.CancelFunc
+	var focusedGeometry niri.WindowGeometry
+	startGeometryPoll := func() {
+		if cancelGeometryPoll != nil {
+			return
+		}
+		pollCtx, cancel := context.WithCancel(ctx)
+		cancelGeometryPoll = cancel
+		updates := make(chan windowGeometryUpdate, 1)
+		geometryUpdates = updates
+		go pollFocusedWindowGeometry(pollCtx, niriClient, updates)
+	}
 	stopGeometryPoll := func() {
 		if cancelGeometryPoll != nil {
 			cancelGeometryPoll()
@@ -268,6 +279,9 @@ func runDevice(
 		geometryUpdates = nil
 	}
 	defer stopGeometryPoll()
+	if usesHorizontalScrollWindowWidthScaling(currentConfig.Device.HorizontalScrollWindowWidthScale) {
+		startGeometryPoll()
+	}
 	lastDPIRequest := dpiRequest{}
 	queueProfileDPI := func(appID string) {
 		preset := currentConfig.PresetForApp(appID)
@@ -324,11 +338,30 @@ func runDevice(
 				status.update()
 			}
 		case update := <-geometryUpdates:
+			if update.err != nil {
+				focusedGeometry = niri.WindowGeometry{}
+				if usesHorizontalScrollWindowWidthScaling(currentConfig.Device.HorizontalScrollWindowWidthScale) {
+					message := fmt.Sprintf(
+						"horizontal scroll width adjustment unavailable; using configured scale: %v",
+						update.err,
+					)
+					if status.data.LastError != message {
+						status.data.LastError = message
+						status.update()
+					}
+				}
+			} else {
+				focusedGeometry = update.geometry
+				if strings.HasPrefix(status.data.LastError, "horizontal scroll width adjustment unavailable;") {
+					status.data.LastError = ""
+					status.update()
+				}
+			}
 			if !gestureActive || engine == nil ||
 				heldPreset.WindowSizeScaling == config.WindowSizeScalingDisabled {
 				continue
 			}
-			geometry := update.geometry
+			geometry := focusedGeometry
 			if update.err != nil {
 				geometry = niri.WindowGeometry{}
 				status.data.LastError = fmt.Sprintf(
@@ -394,14 +427,21 @@ func runDevice(
 						}
 					}
 					queueProfileDPI(focusedAppID)
+					if usesHorizontalScrollWindowWidthScaling(currentConfig.Device.HorizontalScrollWindowWidthScale) {
+						startGeometryPoll()
+					}
 					if currentConfig.Device.TriggerButton != initial.Device.TriggerButton ||
 						currentConfig.Device.Path != initial.Device.Path ||
 						currentConfig.Device.AutoDetect != initial.Device.AutoDetect {
 						status.data.LastError = "input-device settings changed; restart the user service to apply them"
 					}
 					if !suppressTriggerRelease {
+						focusedGeometry = niri.WindowGeometry{}
 						focusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 						geometry, geometryErr := niriClient.FocusedWindowGeometry(focusCtx)
+						if geometryErr == nil {
+							focusedGeometry = geometry
+						}
 						appID := geometry.AppID
 						var appErr error
 						if geometryErr != nil {
@@ -450,12 +490,9 @@ func runDevice(
 							engine = newEngine(preset, xAxis, yAxis)
 							lastEngineTriggerCount = 0
 							_ = engine.Step(gesture.Input{Kind: gesture.ButtonPress})
-							if preset.WindowSizeScaling != config.WindowSizeScalingDisabled {
-								pollCtx, cancel := context.WithCancel(ctx)
-								cancelGeometryPoll = cancel
-								updates := make(chan windowGeometryUpdate, 1)
-								geometryUpdates = updates
-								go pollFocusedWindowGeometry(pollCtx, niriClient, updates)
+							if preset.WindowSizeScaling != config.WindowSizeScalingDisabled ||
+								usesHorizontalScrollWindowWidthScaling(currentConfig.Device.HorizontalScrollWindowWidthScale) {
+								startGeometryPoll()
 							}
 						}
 					}
@@ -464,7 +501,9 @@ func runDevice(
 					status.update()
 				case 0:
 					thumbButtonHeld = false
-					stopGeometryPoll()
+					if !usesHorizontalScrollWindowWidthScaling(currentConfig.Device.HorizontalScrollWindowWidthScale) {
+						stopGeometryPoll()
+					}
 					if suppressTriggerRelease {
 						log.Printf("thumb-button release consumed after config apply; assigned action was skipped")
 						suppressTriggerRelease = false
@@ -549,7 +588,9 @@ func runDevice(
 					}
 					if percent, ok := wheelScale(event.Code, effectiveScrollSettings(preset, currentConfig.Device)); ok {
 						scaled := *event
-						scaled.Value = scaleWheelValue(event.Code, event.Value, percent, wheelRemainders)
+						scaled.Value = scaleWheelValue(event.Code, event.Value,
+							windowWidthAdjustedWheelScale(event.Code, percent, currentConfig.Device.HorizontalScrollWindowWidthScale, focusedGeometry),
+							wheelRemainders)
 						if scaled.Value != 0 {
 							forward(clone, &scaled)
 						}
@@ -580,7 +621,9 @@ func runDevice(
 				}
 				if percent, ok := wheelScale(event.Code, effectiveScrollSettings(preset, currentConfig.Device)); ok {
 					scaled := *event
-					scaled.Value = scaleWheelValue(event.Code, event.Value, percent, wheelRemainders)
+					scaled.Value = scaleWheelValue(event.Code, event.Value,
+						windowWidthAdjustedWheelScale(event.Code, percent, currentConfig.Device.HorizontalScrollWindowWidthScale, focusedGeometry),
+						wheelRemainders)
 					if scaled.Value != 0 {
 						forward(clone, &scaled)
 					}
@@ -681,6 +724,32 @@ func wheelScale(code evdev.EvCode, settings config.Device) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func usesHorizontalScrollWindowWidthScaling(mode config.HorizontalScrollWindowWidthScaling) bool {
+	return mode == config.HorizontalScrollWindowWidthScalingDirect ||
+		mode == config.HorizontalScrollWindowWidthScalingReverse
+}
+
+func windowWidthAdjustedWheelScale(
+	code evdev.EvCode,
+	percent int,
+	mode config.HorizontalScrollWindowWidthScaling,
+	geometry niri.WindowGeometry,
+) float64 {
+	scale := float64(percent)
+	if (code != evdev.REL_HWHEEL && code != evdev.REL_HWHEEL_HI_RES) ||
+		geometry.WindowWidth <= 0 || geometry.OutputWidth <= 0 {
+		return scale
+	}
+	relativeWidth := geometry.WindowWidth / geometry.OutputWidth
+	switch mode {
+	case config.HorizontalScrollWindowWidthScalingDirect:
+		scale *= relativeWidth
+	case config.HorizontalScrollWindowWidthScalingReverse:
+		scale /= relativeWidth
+	}
+	return scale
 }
 
 func effectiveDPI(preset config.Preset, device config.Device) int {
@@ -807,12 +876,12 @@ func retryableDPIError(err error) bool {
 		!strings.Contains(message, "outside the supported range")
 }
 
-func scaleWheelValue(code evdev.EvCode, value int32, percent int, remainders map[evdev.EvCode]float64) int32 {
+func scaleWheelValue(code evdev.EvCode, value int32, percent float64, remainders map[evdev.EvCode]float64) int32 {
 	if percent == 100 {
 		remainders[code] = 0
 		return value
 	}
-	scaled := float64(value)*float64(percent)/100 + remainders[code]
+	scaled := float64(value)*percent/100 + remainders[code]
 	result := int32(scaled)
 	remainders[code] = scaled - float64(result)
 	return result
@@ -1140,7 +1209,7 @@ func releaseMetaKeys(keyboard *evdev.InputDevice, pressed map[evdev.EvCode]bool)
 	}
 }
 
-func dispatchActions(client *niri.Client, actions []config.Action) {
+dafunc dispatchActions(client *niri.Client, actions []config.Action) {
 	for _, action := range actions {
 		switch action.Type {
 		case "", config.ActionNiri:

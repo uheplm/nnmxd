@@ -267,6 +267,61 @@ func TestWheelScaleSelectsAxesAndResolution(t *testing.T) {
 	}
 }
 
+func TestWindowWidthAdjustedWheelScale(t *testing.T) {
+	geometry := niri.WindowGeometry{WindowWidth: 960, OutputWidth: 1920}
+	tests := []struct {
+		name     string
+		code     evdev.EvCode
+		mode     config.HorizontalScrollWindowWidthScaling
+		geometry niri.WindowGeometry
+		want     float64
+	}{
+		{
+			name:     "disabled",
+			code:     evdev.EvCode(0x06),
+			mode:     config.HorizontalScrollWindowWidthScalingDisabled,
+			geometry: geometry,
+			want:     100,
+		},
+		{
+			name:     "direct horizontal",
+			code:     evdev.EvCode(0x06),
+			mode:     config.HorizontalScrollWindowWidthScalingDirect,
+			geometry: geometry,
+			want:     50,
+		},
+		{
+			name:     "reverse horizontal",
+			code:     evdev.EvCode(0x0c),
+			mode:     config.HorizontalScrollWindowWidthScalingReverse,
+			geometry: geometry,
+			want:     200,
+		},
+		{
+			name:     "vertical unaffected",
+			code:     evdev.EvCode(0x08),
+			mode:     config.HorizontalScrollWindowWidthScalingReverse,
+			geometry: geometry,
+			want:     100,
+		},
+		{
+			name:     "missing geometry preserves base scale",
+			code:     evdev.EvCode(0x06),
+			mode:     config.HorizontalScrollWindowWidthScalingReverse,
+			geometry: niri.WindowGeometry{},
+			want:     100,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := windowWidthAdjustedWheelScale(test.code, 100, test.mode, test.geometry)
+			if got != test.want {
+				t.Fatalf("adjusted scale = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestProfileDPIAndScrollSettingsFallBackToDeviceValues(t *testing.T) {
 	deviceSettings := config.Device{DPI: 800, VerticalScroll: 75, HorizontalScroll: 140}
 	preset := config.Preset{}

@@ -28,13 +28,22 @@ const (
 	WindowSizeScalingAll       WindowSizeScaling = "all"
 )
 
+type HorizontalScrollWindowWidthScaling string
+
+const (
+	HorizontalScrollWindowWidthScalingDisabled HorizontalScrollWindowWidthScaling = "disabled"
+	HorizontalScrollWindowWidthScalingDirect   HorizontalScrollWindowWidthScaling = "direct"
+	HorizontalScrollWindowWidthScalingReverse  HorizontalScrollWindowWidthScaling = "reverse"
+)
+
 type Device struct {
-	AutoDetect       bool   `json:"autoDetect"`
-	Path             string `json:"path"`
-	TriggerButton    string `json:"triggerButton"`
-	DPI              int    `json:"dpi"`
-	VerticalScroll   int    `json:"verticalScroll"`
-	HorizontalScroll int    `json:"horizontalScroll"`
+	AutoDetect                       bool                               `json:"autoDetect"`
+	Path                             string                             `json:"path"`
+	TriggerButton                    string                             `json:"triggerButton"`
+	DPI                              int                                `json:"dpi"`
+	VerticalScroll                   int                                `json:"verticalScroll"`
+	HorizontalScroll                 int                                `json:"horizontalScroll"`
+	HorizontalScrollWindowWidthScale HorizontalScrollWindowWidthScaling `json:"horizontalScrollWindowWidthScaling"`
 }
 
 type ActionType string
@@ -138,10 +147,11 @@ func Defaults() Config {
 	return Config{
 		Version: Version,
 		Device: Device{
-			AutoDetect:       true,
-			TriggerButton:    "BTN_FORWARD",
-			VerticalScroll:   100,
-			HorizontalScroll: 100,
+			AutoDetect:                       true,
+			TriggerButton:                    "BTN_FORWARD",
+			VerticalScroll:                   100,
+			HorizontalScroll:                 100,
+			HorizontalScrollWindowWidthScale: HorizontalScrollWindowWidthScalingDisabled,
 		},
 		DefaultPresetID: "default",
 		Presets: []Preset{{
@@ -285,6 +295,15 @@ func (c Config) Validate() error {
 	}
 	if c.Device.HorizontalScroll < 10 || c.Device.HorizontalScroll > 500 {
 		return errors.New("device.horizontalScroll must be between 10 and 500")
+	}
+	switch c.Device.HorizontalScrollWindowWidthScale {
+	case "", HorizontalScrollWindowWidthScalingDisabled,
+		HorizontalScrollWindowWidthScalingDirect, HorizontalScrollWindowWidthScalingReverse:
+	default:
+		return fmt.Errorf(
+			"device.horizontalScrollWindowWidthScaling has unsupported value %q",
+			c.Device.HorizontalScrollWindowWidthScale,
+		)
 	}
 	if len(c.Presets) == 0 {
 		return errors.New("at least one preset is required")

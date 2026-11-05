@@ -118,7 +118,8 @@ The following is a complete example. Empty action `value` strings mean “unassi
     "triggerButton": "BTN_FORWARD",
     "dpi": 0,
     "verticalScroll": 100,
-    "horizontalScroll": 100
+    "horizontalScroll": 100,
+    "horizontalScrollWindowWidthScaling": "disabled"
   },
   "defaultPresetId": "default",
   "presets": [
@@ -183,6 +184,7 @@ The following is a complete example. Empty action `value` strings mean “unassi
 | `dpi` | `0` leaves the observed hardware DPI unchanged; otherwise an integer from `100` to `16000`. The mouse must support the requested HID++ adjustable-DPI value. |
 | `verticalScroll` | Vertical wheel multiplier as an integer percentage from `10` to `500`. Default `100`. |
 | `horizontalScroll` | Horizontal wheel multiplier as an integer percentage from `10` to `500`. Default `100`. |
+| `horizontalScrollWindowWidthScaling` | `disabled`, `direct`, or `reverse`. `direct` multiplies horizontal scroll speed by focused-window width ÷ output width; `reverse` divides by that ratio. Defaults to `disabled`. |
 
 ### Profile fields
 
@@ -235,7 +237,7 @@ Niri and Noctalia argument strings are split with simple shell-like quoting and 
 4. A tap action runs on release only if no gesture, scroll action, thumbwheel action, or configured thumb chord used the hold. Assigned chords run once on click-down and consume their matching release and repeats; unassigned clicks pass through as regular mouse clicks.
 5. In Meta-toggle mode, each thumb press toggles the selected virtual modifier and forwards the physical button event. Held virtual modifier keys are released when the service exits.
 6. Side-button actions are checked against the focused app's profile on each press. An assigned action consumes the press and release; unassigned buttons are forwarded.
-7. Horizontal wheel events use separate bindings with and without the thumb hold. High-resolution horizontal deltas are accumulated into 120-unit detents, capped per event, and legacy horizontal events are skipped when the device also supplies high-resolution events.
+7. Horizontal wheel events use separate bindings with and without the thumb hold. High-resolution horizontal deltas are accumulated into 120-unit detents, capped per event, and legacy horizontal events are skipped when the device also supplies high-resolution events. The optional window-width setting adjusts the effective horizontal multiplier using focused-window logical width ÷ output logical width; direct scaling makes narrower windows scroll slower, and reverse scaling makes them scroll faster.
 
 Niri focus is polled approximately every 250 ms. Profile selection uses exact `app_id` matching, not window titles. The profile active when the thumb hold begins remains the gesture profile for that hold.
 
